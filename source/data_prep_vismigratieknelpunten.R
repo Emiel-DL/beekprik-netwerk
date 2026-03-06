@@ -44,3 +44,5 @@ knelpunten_tijdreeks <- knelpunten %>%
 knelpunten_tijdreeks %>% filter(knelpunt_nummer == "5003-010") %>% View
 
 head(knelpunten_tijdreeks)
+
+st_write(knelpunten_tijdreeks, dsn = here("data", "verwerkt", "vismigratieknelpunten_tijdsreeks.gpkg"))

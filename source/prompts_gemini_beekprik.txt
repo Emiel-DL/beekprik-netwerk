@@ -1,0 +1,2272 @@
+> library(sf)> library(igraph)> library(tidyverse)> library(progress)> library(here)> library(mapview)> library(lwgeom)> library(mapview)> > beekprik <- read.csv(here("data", "ruw", "beekprik", "Finale_data_beekprik_aan_en_afwezigheid_1990_2023.csv")) %>%+ janitor::clean_names() %>%+ st_as_sf(., coords = c("lambert_x", "lambert_y"), crs = 31370)> > mapview(beekprik)> > # netwerk bouwen> > fd <- st_read(here("data", "ruw", "netwerk", "Flow_direction_coordinates.shp"), quiet = T)> nodes <- st_read(here("data", "ruw", "netwerk", "vha_network_junctions.shp"), quiet = T)> > split_lines_equal_length <- function(lines_sf, max_length = 200) {+ + message(paste("Lijnen splitsen in segmenten van max", max_length, "meter..."))+ + # 1. Voorbereiding+ lines_sf <- st_cast(lines_sf, "LINESTRING", warn = FALSE)+ lines_sf$orig_len <- as.numeric(st_length(lines_sf))+ lines_sf$orig_id <- 1:nrow(lines_sf)+ + # 2. Scheid lijnen+ short_lines <- lines_sf %>% filter(orig_len <= max_length)+ long_lines <- lines_sf %>% filter(orig_len > max_length)+ + if (nrow(long_lines) == 0) {+ return(lines_sf)+ }+ + message(paste(" ->", nrow(long_lines), "lange lijnen worden opgeknipt..."))+ + # 3. Bereken aantal segmenten en blaas tabel op+ long_lines$n_segments <- ceiling(long_lines$orig_len / max_length)+ + expanded_lines <- long_lines[rep(row.names(long_lines), long_lines$n_segments), ]+ + expanded_lines <- expanded_lines %>%+ group_by(orig_id) %>%+ mutate(seg_num = row_number()) %>%+ ungroup()+ + # 4. Bereken fracties+ expanded_lines <- expanded_lines %>%+ mutate(+ step_size = max_length / orig_len,+ start_frac = (seg_num - 1) * step_size,+ end_frac = seg_num * step_size+ )+ + # Correctie voor afrondingsfouten (nooit meer dan 100% van de lijn)+ expanded_lines$end_frac[expanded_lines$end_frac > 1] <- 1+ + message(" -> Geometrieën daadwerkelijk knippen (dit kan even duren)...")+ + list_geoms <- mapply(+ function(geom, f_start, f_end) {+ st_linesubstring(geom, from = f_start, to = f_end, tolerance = 0.001)+ },+ expanded_lines$geometry, # Input 1: De geometrie+ expanded_lines$start_frac, # Input 2: Start+ expanded_lines$end_frac, # Input 3: Eind+ SIMPLIFY = FALSE # Zorg dat we een lijst terugkrijgen+ )+ + # Zet de lijst met losse stukjes terug om naar een geometry kolom (sfc)+ expanded_lines$geometry <- st_as_sfc(list_geoms, crs = st_crs(lines_sf))+ + # ---------------------------------------------------+ + # 6. Samenvoegen+ expanded_lines <- expanded_lines %>%+ select(-n_segments, -seg_num, -step_size, -start_frac, -end_frac)+ + final_sf <- bind_rows(short_lines, expanded_lines) %>%+ arrange(orig_id)+ + final_sf$orig_len <- NULL+ final_sf$orig_id <- NULL+ + # Bereken nieuwe lengte+ final_sf$new_length <- as.numeric(st_length(final_sf))+ + message(paste("Klaar! Resultaat:", nrow(final_sf), "segmenten."))+ return(final_sf)+ }> > fd_fine <- split_lines_equal_length(fd, max_length = 200)Lijnen splitsen in segmenten van max 200 meter... -> 36242 lange lijnen worden opgeknipt... -> Geometrieën daadwerkelijk knippen (dit kan even duren)...Klaar! Resultaat: 164456 segmenten.
+
+> > build_river_network_auto_nodes <- function(lines_sf) {+ message("Graaf bouwen: data opschonen en knooppunten genereren...")+ + # --- STAP 0: DATA WASSTRAAT (Cruciaal na knippen) ---+ + # 1. Verwijder lege geometrieën+ lines_sf <- lines_sf[!st_is_empty(lines_sf), ]+ + # 2. Als de data een mix is (GEOMETRYCOLLECTION), haal alleen de lijnen eruit+ # Dit repareert situaties waar punten en lijnen door elkaar staan+ if (any(grepl("GEOMETRY|COLLECTION", st_geometry_type(lines_sf)))) {+ lines_sf <- st_collection_extract(lines_sf, "LINESTRING")+ }+ + # 3. Filter op geometry type: gooi alles weg dat nu nog steeds 'POINT' is+ # We willen enkel (MULTI)LINESTRINGS+ valid_types <- c("LINESTRING", "MULTILINESTRING")+ lines_sf <- lines_sf[st_geometry_type(lines_sf) %in% valid_types, ]+ + # 4. Filter op lengte: alles met lengte 0 (of bijna 0) moet weg+ # Punten die per ongeluk lijnen zijn geworden (start=eind) geven problemen in de graaf+ lines_sf$check_len <- as.numeric(st_length(lines_sf))+ lines_sf <- lines_sf[lines_sf$check_len > 0.001, ] # Filter alles < 1mm+ lines_sf$check_len <- NULL # Opruimen+ + # 5. Nu is het veilig om te casten naar LINESTRING+ lines_sf <- st_cast(lines_sf, "LINESTRING", warn = FALSE)+ + message(paste(" -> Netwerk bevat", nrow(lines_sf), "geldige lijnsegmenten."))+ + # ----------------------------------------------------+ + # --- STAP 1: NODES BEPALEN ---+ + # Start- en eindpunten bepalen+ p_start <- st_line_sample(lines_sf, sample = 0)+ p_end <- st_line_sample(lines_sf, sample = 1)+ + coords_start <- st_coordinates(p_start)+ coords_end <- st_coordinates(p_end)+ + # Maak Node ID's (afgerond op 1mm)+ node_id_start <- paste(round(coords_start[,1], 3), round(coords_start[,2], 3), sep = "_")+ node_id_end <- paste(round(coords_end[,1], 3), round(coords_end[,2], 3), sep = "_")+ + # --- STAP 2: ATTRIBUTEN ---+ + lines_sf$from_node <- node_id_start+ lines_sf$to_node <- node_id_end+ lines_sf$weight <- as.numeric(st_length(lines_sf))+ + # --- STAP 3: GRAAF BOUWEN ---+ + edges <- st_drop_geometry(lines_sf) %>%+ select(from = from_node, to = to_node, weight, everything())+ + g <- graph_from_data_frame(edges, directed = TRUE)+ + message("Graaf succesvol gebouwd!")+ return(list(graph = g, network_sf = lines_sf))+ }> > river_network_fine <- build_river_network_auto_nodes(fd_fine)Graaf bouwen: data opschonen en knooppunten genereren... -> Netwerk bevat 164455 geldige lijnsegmenten.Graaf succesvol gebouwd!
+
+> > head(beekprik)Simple feature collection with 6 features and 10 fields
+
+Geometry type: POINT
+
+Dimension: XY
+
+Bounding box: xmin: 104832 ymin: 157000 xmax: 230600 ymax: 202700
+
+Projected CRS: BD72 / Belgian Lambert 72
+
+x aantal_phm jaar depletie datum naam aanwezig season databron populatie
+
+1 1 71 1989 dubbel 1989-01-01 Steenputbeek 1 winter INBO - Gysa Kapittelbeek
+
+2 2 154 1996 dubbel 1996-06-04 Steenputbeek 1 spring INBO - Gysa Kapittelbeek
+
+3 3 30 2009 unknown 2009-09-17 Terkleppenbeek 1 summer INBO - Gysa Molenbeek
+
+4 4 20 2015 unknown 2015-06-05 Sassegembeek 1 spring INBO - Gysa Zwalmbeek
+
+5 5 2 2020 unknown 2020-03-16 Sassegembeek 1 winter INBO - Gysa Zwalmbeek
+
+6 6 58 1989 dubbel 1989-01-01 Abeek 1 winter INBO - Gysa Itterbeek
+
+geometry
+
+1 POINT (144150 157000)
+
+2 POINT (144150 157000)
+
+3 POINT (107816 161537)
+
+4 POINT (104832 164043)
+
+5 POINT (105116 164124)
+
+6 POINT (230600 202700)
+
+
+
+match_upstream_strahler <- function(biota_sf, # meetpunten biota
+
+                                    quality_sf, # meetpunten te koppelen variabelen
+
+                                    network_list,
+
+                                    discharge_sf = NULL, # hier kan je Hpunt of andere lozingslagen toevoegen
+
+                                    strahler_sf = NULL,
+
+                                    use_strahler = FALSE, # als TRUE mag tussen biota en fc/quality punt maar 1 orde verschillen
+
+                                    strahler_col = "ORDE",
+
+                                    max_dist_m = 5000,
+
+                                    max_downstream_m = 200,   # NIEUW: Max afstand vogelvlucht (ook downstream)
+
+                                    snap_tolerance = 25,
+
+                                    days_before = 30,
+
+                                    days_after = 10,
+
+                                    col_date_biota = "monsternamedatum",
+
+                                    col_date_quality = "monsternamedatum",
+
+                                    selection_mode = "closest_distance",
+
+                                    aggr_method = "mean",
+
+                                    aggr_cols = NULL,
+
+                                    grouping_col = NULL,
+
+                                    vhas_col_network = "VHAS",
+
+                                    vhas_col_biota = NULL,
+
+                                    vhas_col_quality = NULL) {
+
+
+
+  # --- 1. Validatie ---
+
+  valid_modes <- c("closest_distance", "closest_time", "all", "aggregate")
+
+  if (!selection_mode %in% valid_modes) stop("selection_mode moet zijn: 'closest_distance', 'closest_time', 'all' of 'aggregate'")
+
+
+
+  valid_aggr <- c("mean", "min", "max")
+
+  if (!aggr_method %in% valid_aggr) stop("aggr_method moet zijn: 'mean', 'min' of 'max'")
+
+
+
+  if (!is.null(aggr_cols)) {
+
+    missing_cols <- setdiff(aggr_cols, names(quality_sf))
+
+    if (length(missing_cols) > 0) stop(paste("aggr_cols niet gevonden in quality_sf:", paste(missing_cols, collapse=", ")))
+
+  }
+
+
+
+  if (use_strahler) {
+
+    if (is.null(strahler_sf)) stop("Je hebt 'use_strahler = TRUE' gezet, maar geen 'strahler_sf' opgegeven.")
+
+    if (!strahler_col %in% names(strahler_sf)) stop(paste("Kolom", strahler_col, "niet gevonden in strahler_sf."))
+
+    message(paste0("Strahler filter geactiveerd (max 1 orde verschil, max snap afstand: ", snap_tolerance, "m)."))
+
+  }
+
+
+
+  g <- network_list$graph
+
+  net_sf <- network_list$network_sf
+
+
+
+  if (!is.null(grouping_col)) {
+
+    if (!grouping_col %in% names(net_sf)) stop(paste("De grouping_col", grouping_col, "bestaat niet in je netwerk!"))
+
+    message(paste0("Grouping geactiveerd: enkel matchen binnen zelfde '", grouping_col, "'."))
+
+  }
+
+
+
+  # Datum conversies
+
+  biota_sf[[col_date_biota]] <- as.Date(biota_sf[[col_date_biota]])
+
+  quality_sf[[col_date_quality]] <- as.Date(quality_sf[[col_date_quality]])
+
+  biota_sf$tmp_join_id <- seq_len(nrow(biota_sf))
+
+
+
+  # We voegen een index toe aan quality_sf om later geometries terug te vinden
+
+  quality_sf$orig_index_geo <- seq_len(nrow(quality_sf))
+
+
+
+  message("1/5 Snapping points to river network...")
+
+
+
+  # --- HYBRID SNAP FUNCTIE ---
+
+  snap_and_attribute <- function(points, network, grp_col, tol, vhas_col_pts, vhas_col_net) {
+
+    points$node_id <- NA
+
+    if (!is.null(grp_col)) points$match_group_val <- NA
+
+
+
+    # 1. VHAS MATCHING
+
+    has_vhas_config <- !is.null(vhas_col_pts) && !is.null(vhas_col_net)
+
+    can_use_vhas <- has_vhas_config && (vhas_col_pts %in% names(points)) && (vhas_col_net %in% names(network))
+
+
+
+    if (can_use_vhas) {
+
+      pts_with_vhas_idx <- which(!is.na(points[[vhas_col_pts]]))
+
+      if (length(pts_with_vhas_idx) > 0) {
+
+        unique_codes <- unique(points[[vhas_col_pts]][pts_with_vhas_idx])
+
+        for (code in unique_codes) {
+
+          net_idx <- which(network[[vhas_col_net]] == code)
+
+          if (length(net_idx) > 0) {
+
+            p_subset_idx <- which(points[[vhas_col_pts]] == code)
+
+            rel_nearest <- st_nearest_feature(points[p_subset_idx,], network[net_idx,])
+
+            abs_nearest <- net_idx[rel_nearest]
+
+            points$node_id[p_subset_idx] <- as.character(network$from_node[abs_nearest])
+
+            if (!is.null(grp_col)) points$match_group_val[p_subset_idx] <- network[[grp_col]][abs_nearest]
+
+          }
+
+        }
+
+      }
+
+    }
+
+
+
+    # 2. GEOMETRIC FALLBACK
+
+    missing_idx <- which(is.na(points$node_id))
+
+    if (length(missing_idx) > 0) {
+
+      subset_pts <- points[missing_idx, ]
+
+      nearest_idx <- st_nearest_feature(subset_pts, network)
+
+      dists <- st_distance(subset_pts, network[nearest_idx, ], by_element = TRUE)
+
+      dists_num <- as.numeric(dists)
+
+      dists_num[is.na(dists_num)] <- Inf
+
+
+
+      valid_snaps <- dists_num <= tol
+
+      valid_global_idx <- missing_idx[valid_snaps]
+
+      valid_net_idx <- nearest_idx[valid_snaps]
+
+
+
+      if (length(valid_global_idx) > 0) {
+
+        points$node_id[valid_global_idx] <- as.character(network$from_node[valid_net_idx])
+
+        if (!is.null(grp_col)) points$match_group_val[valid_global_idx] <- network[[grp_col]][valid_net_idx]
+
+      }
+
+
+
+      n_dropped <- length(missing_idx) - length(valid_global_idx)
+
+      if (n_dropped > 0) message(paste("      ->", n_dropped, "points dropped (too far/no VHAS match)."))
+
+    }
+
+    return(points)
+
+  }
+
+
+
+  biota_sf <- snap_and_attribute(biota_sf, net_sf, grouping_col, snap_tolerance, vhas_col_biota, vhas_col_network)
+
+  quality_sf <- snap_and_attribute(quality_sf, net_sf, grouping_col, snap_tolerance, vhas_col_quality, vhas_col_network)
+
+
+
+  # --- Strahler Snapping ---
+
+  if (use_strahler) {
+
+    message("    -> Determining Strahler order...")
+
+    get_strahler_order <- function(pts, str_layer, str_col, tol) {
+
+      idx <- st_nearest_feature(pts, str_layer)
+
+      dists <- st_distance(pts, str_layer[idx, ], by_element = TRUE)
+
+      dists_num <- as.numeric(dists)
+
+      dists_num[is.na(dists_num)] <- Inf
+
+      vals <- rep(NA, nrow(pts))
+
+      valid <- dists_num <= tol
+
+      vals[valid] <- str_layer[[str_col]][idx[valid]]
+
+      return(vals)
+
+    }
+
+    biota_sf$strahler_val <- as.numeric(get_strahler_order(biota_sf, strahler_sf, strahler_col, snap_tolerance))
+
+    quality_sf$strahler_val <- as.numeric(get_strahler_order(quality_sf, strahler_sf, strahler_col, snap_tolerance))
+
+  }
+
+
+
+  quality_df <- st_drop_geometry(quality_sf)
+
+
+
+  # --- Discharge Snapping ---
+
+  discharge_nodes <- character(0)
+
+  if (!is.null(discharge_sf)) {
+
+    message("    -> Snapping discharge points...")
+
+    idx_dis <- st_nearest_feature(discharge_sf, net_sf)
+
+    dists_dis <- st_distance(discharge_sf, net_sf[idx_dis, ], by_element = TRUE)
+
+    dists_num <- as.numeric(dists_dis)
+
+    dists_num[is.na(dists_num)] <- Inf
+
+    valid_dis <- dists_num <= snap_tolerance
+
+    if (sum(valid_dis) > 0) {
+
+      discharge_nodes <- unique(as.character(net_sf$from_node[idx_dis[valid_dis]]))
+
+    }
+
+  }
+
+
+
+  message(paste0("2/5 Matching points (Mode: ", selection_mode, " | Upstream: ", max_dist_m, "m OR Local: ", max_downstream_m, "m)..."))
+
+
+
+  results <- list()
+
+  pb <- progress_bar$new(format = "  [:bar] :percent eta: :eta", total = nrow(biota_sf), clear = FALSE, width = 60)
+
+
+
+  for (i in seq_len(nrow(biota_sf))) {
+
+    pb$tick()
+
+    b_pt <- biota_sf[i, ]
+
+    b_node <- b_pt$node_id
+
+    b_id   <- b_pt$tmp_join_id
+
+    match <- NA
+
+    n_matches_found <- 0
+
+
+
+    if (is.na(b_node)) {
+
+      match <- quality_df[1, ]
+
+      match[] <- NA; match$river_dist_m <- NA
+
+    } else {
+
+      b_date <- b_pt[[col_date_biota]]
+
+
+
+      # STAP 1: Pas eerst alle niet-ruimtelijke filters toe (Datum, Groep, Strahler)
+
+      subset_quality <- quality_df %>% filter(!is.na(node_id))
+
+
+
+      if (!is.null(grouping_col)) {
+
+        b_group_val <- b_pt$match_group_val
+
+        if (!is.na(b_group_val)) {
+
+          subset_quality <- subset_quality %>% filter(match_group_val == b_group_val)
+
+        } else {
+
+          subset_quality <- subset_quality[0, ]
+
+        }
+
+      }
+
+
+
+      if (use_strahler && nrow(subset_quality) > 0) {
+
+        b_strahler <- b_pt$strahler_val
+
+        if (!is.na(b_strahler)) {
+
+          subset_quality <- subset_quality %>% filter(!is.na(strahler_val), abs(strahler_val - b_strahler) <= 1)
+
+        } else {
+
+          subset_quality <- subset_quality[0, ]
+
+        }
+
+      }
+
+
+
+      # Filter op tijd
+
+      if (nrow(subset_quality) > 0) {
+
+        subset_quality <- subset_quality %>%
+
+          mutate(
+
+            temp_diff_days = as.numeric(difftime(b_date, .[[col_date_quality]], units = "days")),
+
+            abs_time_diff  = abs(temp_diff_days)
+
+          ) %>%
+
+          filter(temp_diff_days >= -days_after & temp_diff_days <= days_before)
+
+      }
+
+
+
+      if (nrow(subset_quality) > 0) {
+
+
+
+        # STAP 2: Bereken afstanden (Graaf EN Euclidisch)
+
+
+
+        # A. Graaf Afstand (alleen upstream werkt hier, downstream geeft Inf)
+
+        upstream_nodes <- names(subcomponent(g, v = b_node, mode = "in"))
+
+        subset_quality$is_upstream <- subset_quality$node_id %in% upstream_nodes
+
+
+
+        # Bereken graafafstand (alleen zinvol voor upstream, maar we runnen voor subset)
+
+        d_matrix <- distances(g, v = subset_quality$node_id, to = b_node, mode = "out")
+
+        subset_quality$graph_dist <- as.numeric(d_matrix)
+
+
+
+        # B. Euclidische Afstand (Vogelvlucht)
+
+        # We moeten de geometry ophalen uit de originele quality_sf
+
+        # Dit doen we via de index die we eerder hebben opgeslagen
+
+        target_geoms <- quality_sf[subset_quality$orig_index_geo, ]
+
+        euclid_dists <- st_distance(b_pt, target_geoms)
+
+        subset_quality$euclid_dist <- as.numeric(euclid_dists)
+
+
+
+        # STAP 3: De 'OR' Filter
+
+        # Kandidaat is geldig als:
+
+        # (Is Upstream EN GraphDist <= 5000) OF (EuclidDist <= 200)
+
+
+
+        candidates <- subset_quality %>%
+
+          filter(
+
+            (is_upstream & graph_dist <= max_dist_m) |
+
+              (euclid_dist <= max_downstream_m)
+
+          )
+
+
+
+        # STAP 4: Bepaal de 'definitive' afstand voor sortering
+
+        # Als het upstream is -> Graph dist
+
+        # Als het downstream is (graph=Inf) -> Euclid dist
+
+        # Als het beide is (kortbij upstream) -> Graph dist (consistentie)
+
+        if (nrow(candidates) > 0) {
+
+          candidates$river_dist_m <- ifelse(is.finite(candidates$graph_dist),
+
+                                            candidates$graph_dist,
+
+                                            candidates$euclid_dist)
+
+
+
+          # Topology check (Lozingen) - enkel relevant voor upstream paden!
+
+          # Als een punt downstream ligt, heeft een lozing stroomopwaarts (tussen biota en qual) geen invloed op qual.
+
+          if (length(discharge_nodes) > 0) {
+
+            # We checken alleen de kandidaten die 'upstream' zijn volgens de graaf
+
+            to_check_idx <- which(candidates$is_upstream & candidates$river_dist_m > 0)
+
+
+
+            if(length(to_check_idx) > 0) {
+
+              keep_flags <- rep(TRUE, nrow(candidates))
+
+
+
+              checks <- sapply(candidates$node_id[to_check_idx], function(cand_node) {
+
+                if (cand_node == b_node) return(TRUE)
+
+                path_res <- shortest_paths(g, from = cand_node, to = b_node, mode = "out")
+
+                intermediate_nodes <- setdiff(names(path_res$vpath[[1]]), c(cand_node, b_node))
+
+                if (any(intermediate_nodes %in% discharge_nodes)) return(FALSE) else return(TRUE)
+
+              })
+
+
+
+              keep_flags[to_check_idx] <- checks
+
+              candidates <- candidates[keep_flags, ]
+
+            }
+
+          }
+
+
+
+          candidates_within <- candidates # Naamgeving consistent houden
+
+
+
+          if (nrow(candidates_within) > 0) {
+
+            # ... (Selectie logica blijft hetzelfde) ...
+
+            if (selection_mode == "closest_distance") {
+
+              match <- candidates_within[which.min(candidates_within$river_dist_m), ]; n_matches_found <- 1
+
+            } else if (selection_mode == "closest_time") {
+
+              match <- candidates_within[which.min(candidates_within$abs_time_diff), ]; n_matches_found <- 1
+
+            } else if (selection_mode == "all") {
+
+              match <- candidates_within; n_matches_found <- nrow(candidates_within)
+
+            } else if (selection_mode == "aggregate") {
+
+              n_matches_found <- nrow(candidates_within)
+
+              if (!is.null(aggr_cols)) { cols_to_agg <- aggr_cols } else {
+
+                tech_cols <- c("node_id", "river_dist_m", "temp_diff_days", "abs_time_diff", "strahler_val", "match_group_val", "orig_index_geo", "graph_dist", "euclid_dist", "is_upstream")
+
+                num_cols <- names(select_if(candidates_within, is.numeric))
+
+                cols_to_agg <- setdiff(num_cols, tech_cols)
+
+              }
+
+              agg_fun <- switch(aggr_method, "mean"=function(x) mean(x, na.rm=T), "min"=function(x) min(x, na.rm=T), "max"=function(x) max(x, na.rm=T))
+
+
+
+              if (length(cols_to_agg) > 0) {
+
+                agg_values <- candidates_within %>% summarise(across(all_of(cols_to_agg), agg_fun))
+
+                match <- candidates_within[1, ]
+
+                match[, cols_to_agg] <- agg_values
+
+              } else { match <- candidates_within[1, ] }
+
+              match$river_dist_m <- mean(candidates_within$river_dist_m)
+
+            }
+
+          }
+
+        }
+
+      }
+
+      if (!is.data.frame(match)) { match <- quality_df[1, ]; match[] <- NA; match$river_dist_m <- NA }
+
+    }
+
+    match$biota_match_id <- b_id
+
+    match$n_matches <- n_matches_found
+
+    # Cleanup extra kolommen
+
+    cols_to_remove <- c("temp_diff_days", "abs_time_diff", "match_group_val", "strahler_val", "orig_index_geo", "graph_dist", "euclid_dist", "is_upstream")
+
+    match[, base::intersect(names(match), cols_to_remove)] <- NULL
+
+    results[[i]] <- match
+
+  }
+
+
+
+  message("3/5 Merging results...")
+
+  matched_quality_df <- do.call(rbind, results)
+
+  cols_to_rename <- setdiff(names(matched_quality_df), "biota_match_id")
+
+  names(matched_quality_df)[names(matched_quality_df) %in% cols_to_rename] <- paste0("qual_", cols_to_rename)
+
+  final_sf <- left_join(biota_sf, matched_quality_df, by = c("tmp_join_id" = "biota_match_id"))
+
+
+
+  final_sf$tmp_join_id <- NULL
+
+  if("match_group_val" %in% names(final_sf)) final_sf$match_group_val <- NULL
+
+  if("strahler_val" %in% names(final_sf)) final_sf$strahler_val <- NULL
+
+
+
+  return(final_sf)
+
+}
+
+
+
+kan je mijn R code en functie aanpassen voor het volgende te doen. In plaats van koppelen van MI met quality punten geeft ik een laag met observaties van beekprik over verschillende jaren. nu wil ik op basis van die observaties voor bepaalde tijdsvensters die te specifieren zijn alle segmenten hebben die op x km van een observatie liggen om zo te komen tot areaalclusters (multilinestring) van beekprik.
+
+Gemini zei
+Dit is een interessante verschuiving in de logica. In plaats van een point-to-point koppeling (Biota naar Quality), gaan we nu naar een point-to-network selectie. Je wilt een "buffer" op het netwerk genereren rondom je observaties.
+
+Omdat je met 164.000 segmenten werkt, is efficiëntie cruciaal. Hieronder vind je de aangepaste functie get_beekprik_clusters.
+
+De aanpak
+Tijdsfilter: We filteren de observaties (beekprik) eerst op het gewenste jaar/venster.
+
+Network Snapping: We bepalen op welke node in het netwerk de beekprik ligt.
+
+Graph Traversal: We gebruiken igraph::distances om in één klap alle nodes te vinden die binnen X km liggen (zowel upstream als downstream, aangezien een cluster zich in beide richtingen verspreidt).
+
+Segment Selectie: We halen alle lijnsegmenten op die verbonden zijn met deze "bereikbare" nodes.
+
+Unificatie: We voegen de segmenten samen tot MULTILINESTRING per cluster of jaar.
+
+De R Functie: get_beekprik_clusters
+R
+get_beekprik_clusters <- function(observations_sf, 
+                                  network_list, 
+                                  target_years = NULL, 
+                                  max_dist_m = 5000, 
+                                  snap_tolerance = 50) {
+  
+  library(sf)
+  library(igraph)
+  library(tidyverse)
+  
+  g <- network_list$graph
+  net_sf <- network_list$network_sf
+  
+  # 1. Filter op jaren (indien opgegeven)
+  if (!is.null(target_
+Je hebt deze reactie gestopt
+Jij zei
+> library(sf)> library(igraph)> library(tidyverse)> library(progress)> library(here)> library(mapview)> library(lwgeom)> library(mapview)> > beekprik <- read.csv(here("data", "ruw", "beekprik", "Finale_data_beekprik_aan_en_afwezigheid_1990_2023.csv")) %>%+ janitor::clean_names() %>%+ st_as_sf(., coords = c("lambert_x", "lambert_y"), crs = 31370)> > mapview(beekprik)> > # netwerk bouwen> > fd <- st_read(here("data", "ruw", "netwerk", "Flow_direction_coordinates.shp"), quiet = T)> nodes <- st_read(here("data", "ruw", "netwerk", "vha_network_junctions.shp"), quiet = T)> > split_lines_equal_length <- function(lines_sf, max_length = 200) {+ + message(paste("Lijnen splitsen in segmenten van max", max_length, "meter..."))+ + # 1. Voorbereiding+ lines_sf <- st_cast(lines_sf, "LINESTRING", warn = FALSE)+ lines_sf$orig_len <- as.numeric(st_length(lines_sf))+ lines_sf$orig_id <- 1:nrow(lines_sf)+ + # 2. Scheid lijnen+ short_lines <- lines_sf %>% filter(orig_len <= max_length)+ long_lines <- lines_sf %>% filter(orig_len > max_length)+ + if (nrow(long_lines) == 0) {+ return(lines_sf)+ }+ + message(paste(" ->", nrow(long_lines), "lange lijnen worden opgeknipt..."))+ + # 3. Bereken aantal segmenten en blaas tabel op+ long_lines$n_segments <- ceiling(long_lines$orig_len / max_length)+ + expanded_lines <- long_lines[rep(row.names(long_lines), long_lines$n_segments), ]+ + expanded_lines <- expanded_lines %>%+ group_by(orig_id) %>%+ mutate(seg_num = row_number()) %>%+ ungroup()+ + # 4. Bereken fracties+ expanded_lines <- expanded_lines %>%+ mutate(+ step_size = max_length / orig_len,+ start_frac = (seg_num - 1) * step_size,+ end_frac = seg_num * step_size+ )+ + # Correctie voor afrondingsfouten (nooit meer dan 100% van de lijn)+ expanded_lines$end_frac[expanded_lines$end_frac > 1] <- 1+ + message(" -> Geometrieën daadwerkelijk knippen (dit kan even duren)...")+ + list_geoms <- mapply(+ function(geom, f_start, f_end) {+ st_linesubstring(geom, from = f_start, to = f_end, tolerance = 0.001)+ },+ expanded_lines$geometry, # Input 1: De geometrie+ expanded_lines$start_frac, # Input 2: Start+ expanded_lines$end_frac, # Input 3: Eind+ SIMPLIFY = FALSE # Zorg dat we een lijst terugkrijgen+ )+ + # Zet de lijst met losse stukjes terug om naar een geometry kolom (sfc)+ expanded_lines$geometry <- st_as_sfc(list_geoms, crs = st_crs(lines_sf))+ + # ---------------------------------------------------+ + # 6. Samenvoegen+ expanded_lines <- expanded_lines %>%+ select(-n_segments, -seg_num, -step_size, -start_frac, -end_frac)+ + final_sf <- bind_rows(short_lines, expanded_lines) %>%+ arrange(orig_id)+ + final_sf$orig_len <- NULL+ final_sf$orig_id <- NULL+ + # Bereken nieuwe lengte+ final_sf$new_length <- as.numeric(st_length(final_sf))+ + message(paste("Klaar! Resultaat:", nrow(final_sf), "segmenten."))+ return(final_sf)+ }> > fd_fine <- split_lines_equal_length(fd, max_length = 200)Lijnen splitsen in segmenten van max 200 meter... -> 36242 lange lijnen worden opgeknipt... -> Geometrieën daadwerkelijk knippen (dit kan even duren)...Klaar! Resultaat: 164456 segmenten.
+
+> > build_river_network_auto_nodes <- function(lines_sf) {+ message("Graaf bouwen: data opschonen en knooppunten genereren...")+ + # --- STAP 0: DATA WASSTRAAT (Cruciaal na knippen) ---+ + # 1. Verwijder lege geometrieën+ lines_sf <- lines_sf[!st_is_empty(lines_sf), ]+ + # 2. Als de data een mix is (GEOMETRYCOLLECTION), haal alleen de lijnen eruit+ # Dit repareert situaties waar punten en lijnen door elkaar staan+ if (any(grepl("GEOMETRY|COLLECTION", st_geometry_type(lines_sf)))) {+ lines_sf <- st_collection_extract(lines_sf, "LINESTRING")+ }+ + # 3. Filter op geometry type: gooi alles weg dat nu nog steeds 'POINT' is+ # We willen enkel (MULTI)LINESTRINGS+ valid_types <- c("LINESTRING", "MULTILINESTRING")+ lines_sf <- lines_sf[st_geometry_type(lines_sf) %in% valid_types, ]+ + # 4. Filter op lengte: alles met lengte 0 (of bijna 0) moet weg+ # Punten die per ongeluk lijnen zijn geworden (start=eind) geven problemen in de graaf+ lines_sf$check_len <- as.numeric(st_length(lines_sf))+ lines_sf <- lines_sf[lines_sf$check_len > 0.001, ] # Filter alles < 1mm+ lines_sf$check_len <- NULL # Opruimen+ + # 5. Nu is het veilig om te casten naar LINESTRING+ lines_sf <- st_cast(lines_sf, "LINESTRING", warn = FALSE)+ + message(paste(" -> Netwerk bevat", nrow(lines_sf), "geldige lijnsegmenten."))+ + # ----------------------------------------------------+ + # --- STAP 1: NODES BEPALEN ---+ + # Start- en eindpunten bepalen+ p_start <- st_line_sample(lines_sf, sample = 0)+ p_end <- st_line_sample(lines_sf, sample = 1)+ + coords_start <- st_coordinates(p_start)+ coords_end <- st_coordinates(p_end)+ + # Maak Node ID's (afgerond op 1mm)+ node_id_start <- paste(round(coords_start[,1], 3), round(coords_start[,2], 3), sep = "_")+ node_id_end <- paste(round(coords_end[,1], 3), round(coords_end[,2], 3), sep = "_")+ + # --- STAP 2: ATTRIBUTEN ---+ + lines_sf$from_node <- node_id_start+ lines_sf$to_node <- node_id_end+ lines_sf$weight <- as.numeric(st_length(lines_sf))+ + # --- STAP 3: GRAAF BOUWEN ---+ + edges <- st_drop_geometry(lines_sf) %>%+ select(from = from_node, to = to_node, weight, everything())+ + g <- graph_from_data_frame(edges, directed = TRUE)+ + message("Graaf succesvol gebouwd!")+ return(list(graph = g, network_sf = lines_sf))+ }> > river_network_fine <- build_river_network_auto_nodes(fd_fine)Graaf bouwen: data opschonen en knooppunten genereren... -> Netwerk bevat 164455 geldige lijnsegmenten.Graaf succesvol gebouwd!
+
+> > head(beekprik)Simple feature collection with 6 features and 10 fields
+
+Geometry type: POINT
+
+Dimension: XY
+
+Bounding box: xmin: 104832 ymin: 157000 xmax: 230600 ymax: 202700
+
+Projected CRS: BD72 / Belgian Lambert 72
+
+x aantal_phm jaar depletie datum naam aanwezig season databron populatie
+
+1 1 71 1989 dubbel 1989-01-01 Steenputbeek 1 winter INBO - Gysa Kapittelbeek
+
+2 2 154 1996 dubbel 1996-06-04 Steenputbeek 1 spring INBO - Gysa Kapittelbeek
+
+3 3 30 2009 unknown 2009-09-17 Terkleppenbeek 1 summer INBO - Gysa Molenbeek
+
+4 4 20 2015 unknown 2015-06-05 Sassegembeek 1 spring INBO - Gysa Zwalmbeek
+
+5 5 2 2020 unknown 2020-03-16 Sassegembeek 1 winter INBO - Gysa Zwalmbeek
+
+6 6 58 1989 dubbel 1989-01-01 Abeek 1 winter INBO - Gysa Itterbeek
+
+geometry
+
+1 POINT (144150 157000)
+
+2 POINT (144150 157000)
+
+3 POINT (107816 161537)
+
+4 POINT (104832 164043)
+
+5 POINT (105116 164124)
+
+6 POINT (230600 202700)
+
+
+
+match_upstream_strahler <- function(biota_sf, # meetpunten biota
+
+                                    quality_sf, # meetpunten te koppelen variabelen
+
+                                    network_list,
+
+                                    discharge_sf = NULL, # hier kan je Hpunt of andere lozingslagen toevoegen
+
+                                    strahler_sf = NULL,
+
+                                    use_strahler = FALSE, # als TRUE mag tussen biota en fc/quality punt maar 1 orde verschillen
+
+                                    strahler_col = "ORDE",
+
+                                    max_dist_m = 5000,
+
+                                    max_downstream_m = 200,   # NIEUW: Max afstand vogelvlucht (ook downstream)
+
+                                    snap_tolerance = 25,
+
+                                    days_before = 30,
+
+                                    days_after = 10,
+
+                                    col_date_biota = "monsternamedatum",
+
+                                    col_date_quality = "monsternamedatum",
+
+                                    selection_mode = "closest_distance",
+
+                                    aggr_method = "mean",
+
+                                    aggr_cols = NULL,
+
+                                    grouping_col = NULL,
+
+                                    vhas_col_network = "VHAS",
+
+                                    vhas_col_biota = NULL,
+
+                                    vhas_col_quality = NULL) {
+
+
+
+  # --- 1. Validatie ---
+
+  valid_modes <- c("closest_distance", "closest_time", "all", "aggregate")
+
+  if (!selection_mode %in% valid_modes) stop("selection_mode moet zijn: 'closest_distance', 'closest_time', 'all' of 'aggregate'")
+
+
+
+  valid_aggr <- c("mean", "min", "max")
+
+  if (!aggr_method %in% valid_aggr) stop("aggr_method moet zijn: 'mean', 'min' of 'max'")
+
+
+
+  if (!is.null(aggr_cols)) {
+
+    missing_cols <- setdiff(aggr_cols, names(quality_sf))
+
+    if (length(missing_cols) > 0) stop(paste("aggr_cols niet gevonden in quality_sf:", paste(missing_cols, collapse=", ")))
+
+  }
+
+
+
+  if (use_strahler) {
+
+    if (is.null(strahler_sf)) stop("Je hebt 'use_strahler = TRUE' gezet, maar geen 'strahler_sf' opgegeven.")
+
+    if (!strahler_col %in% names(strahler_sf)) stop(paste("Kolom", strahler_col, "niet gevonden in strahler_sf."))
+
+    message(paste0("Strahler filter geactiveerd (max 1 orde verschil, max snap afstand: ", snap_tolerance, "m)."))
+
+  }
+
+
+
+  g <- network_list$graph
+
+  net_sf <- network_list$network_sf
+
+
+
+  if (!is.null(grouping_col)) {
+
+    if (!grouping_col %in% names(net_sf)) stop(paste("De grouping_col", grouping_col, "bestaat niet in je netwerk!"))
+
+    message(paste0("Grouping geactiveerd: enkel matchen binnen zelfde '", grouping_col, "'."))
+
+  }
+
+
+
+  # Datum conversies
+
+  biota_sf[[col_date_biota]] <- as.Date(biota_sf[[col_date_biota]])
+
+  quality_sf[[col_date_quality]] <- as.Date(quality_sf[[col_date_quality]])
+
+  biota_sf$tmp_join_id <- seq_len(nrow(biota_sf))
+
+
+
+  # We voegen een index toe aan quality_sf om later geometries terug te vinden
+
+  quality_sf$orig_index_geo <- seq_len(nrow(quality_sf))
+
+
+
+  message("1/5 Snapping points to river network...")
+
+
+
+  # --- HYBRID SNAP FUNCTIE ---
+
+  snap_and_attribute <- function(points, network, grp_col, tol, vhas_col_pts, vhas_col_net) {
+
+    points$node_id <- NA
+
+    if (!is.null(grp_col)) points$match_group_val <- NA
+
+
+
+    # 1. VHAS MATCHING
+
+    has_vhas_config <- !is.null(vhas_col_pts) && !is.null(vhas_col_net)
+
+    can_use_vhas <- has_vhas_config && (vhas_col_pts %in% names(points)) && (vhas_col_net %in% names(network))
+
+
+
+    if (can_use_vhas) {
+
+      pts_with_vhas_idx <- which(!is.na(points[[vhas_col_pts]]))
+
+      if (length(pts_with_vhas_idx) > 0) {
+
+        unique_codes <- unique(points[[vhas_col_pts]][pts_with_vhas_idx])
+
+        for (code in unique_codes) {
+
+          net_idx <- which(network[[vhas_col_net]] == code)
+
+          if (length(net_idx) > 0) {
+
+            p_subset_idx <- which(points[[vhas_col_pts]] == code)
+
+            rel_nearest <- st_nearest_feature(points[p_subset_idx,], network[net_idx,])
+
+            abs_nearest <- net_idx[rel_nearest]
+
+            points$node_id[p_subset_idx] <- as.character(network$from_node[abs_nearest])
+
+            if (!is.null(grp_col)) points$match_group_val[p_subset_idx] <- network[[grp_col]][abs_nearest]
+
+          }
+
+        }
+
+      }
+
+    }
+
+
+
+    # 2. GEOMETRIC FALLBACK
+
+    missing_idx <- which(is.na(points$node_id))
+
+    if (length(missing_idx) > 0) {
+
+      subset_pts <- points[missing_idx, ]
+
+      nearest_idx <- st_nearest_feature(subset_pts, network)
+
+      dists <- st_distance(subset_pts, network[nearest_idx, ], by_element = TRUE)
+
+      dists_num <- as.numeric(dists)
+
+      dists_num[is.na(dists_num)] <- Inf
+
+
+
+      valid_snaps <- dists_num <= tol
+
+      valid_global_idx <- missing_idx[valid_snaps]
+
+      valid_net_idx <- nearest_idx[valid_snaps]
+
+
+
+      if (length(valid_global_idx) > 0) {
+
+        points$node_id[valid_global_idx] <- as.character(network$from_node[valid_net_idx])
+
+        if (!is.null(grp_col)) points$match_group_val[valid_global_idx] <- network[[grp_col]][valid_net_idx]
+
+      }
+
+
+
+      n_dropped <- length(missing_idx) - length(valid_global_idx)
+
+      if (n_dropped > 0) message(paste("      ->", n_dropped, "points dropped (too far/no VHAS match)."))
+
+    }
+
+    return(points)
+
+  }
+
+
+
+  biota_sf <- snap_and_attribute(biota_sf, net_sf, grouping_col, snap_tolerance, vhas_col_biota, vhas_col_network)
+
+  quality_sf <- snap_and_attribute(quality_sf, net_sf, grouping_col, snap_tolerance, vhas_col_quality, vhas_col_network)
+
+
+
+  # --- Strahler Snapping ---
+
+  if (use_strahler) {
+
+    message("    -> Determining Strahler order...")
+
+    get_strahler_order <- function(pts, str_layer, str_col, tol) {
+
+      idx <- st_nearest_feature(pts, str_layer)
+
+      dists <- st_distance(pts, str_layer[idx, ], by_element = TRUE)
+
+      dists_num <- as.numeric(dists)
+
+      dists_num[is.na(dists_num)] <- Inf
+
+      vals <- rep(NA, nrow(pts))
+
+      valid <- dists_num <= tol
+
+      vals[valid] <- str_layer[[str_col]][idx[valid]]
+
+      return(vals)
+
+    }
+
+    biota_sf$strahler_val <- as.numeric(get_strahler_order(biota_sf, strahler_sf, strahler_col, snap_tolerance))
+
+    quality_sf$strahler_val <- as.numeric(get_strahler_order(quality_sf, strahler_sf, strahler_col, snap_tolerance))
+
+  }
+
+
+
+  quality_df <- st_drop_geometry(quality_sf)
+
+
+
+  # --- Discharge Snapping ---
+
+  discharge_nodes <- character(0)
+
+  if (!is.null(discharge_sf)) {
+
+    message("    -> Snapping discharge points...")
+
+    idx_dis <- st_nearest_feature(discharge_sf, net_sf)
+
+    dists_dis <- st_distance(discharge_sf, net_sf[idx_dis, ], by_element = TRUE)
+
+    dists_num <- as.numeric(dists_dis)
+
+    dists_num[is.na(dists_num)] <- Inf
+
+    valid_dis <- dists_num <= snap_tolerance
+
+    if (sum(valid_dis) > 0) {
+
+      discharge_nodes <- unique(as.character(net_sf$from_node[idx_dis[valid_dis]]))
+
+    }
+
+  }
+
+
+
+  message(paste0("2/5 Matching points (Mode: ", selection_mode, " | Upstream: ", max_dist_m, "m OR Local: ", max_downstream_m, "m)..."))
+
+
+
+  results <- list()
+
+  pb <- progress_bar$new(format = "  [:bar] :percent eta: :eta", total = nrow(biota_sf), clear = FALSE, width = 60)
+
+
+
+  for (i in seq_len(nrow(biota_sf))) {
+
+    pb$tick()
+
+    b_pt <- biota_sf[i, ]
+
+    b_node <- b_pt$node_id
+
+    b_id   <- b_pt$tmp_join_id
+
+    match <- NA
+
+    n_matches_found <- 0
+
+
+
+    if (is.na(b_node)) {
+
+      match <- quality_df[1, ]
+
+      match[] <- NA; match$river_dist_m <- NA
+
+    } else {
+
+      b_date <- b_pt[[col_date_biota]]
+
+
+
+      # STAP 1: Pas eerst alle niet-ruimtelijke filters toe (Datum, Groep, Strahler)
+
+      subset_quality <- quality_df %>% filter(!is.na(node_id))
+
+
+
+      if (!is.null(grouping_col)) {
+
+        b_group_val <- b_pt$match_group_val
+
+        if (!is.na(b_group_val)) {
+
+          subset_quality <- subset_quality %>% filter(match_group_val == b_group_val)
+
+        } else {
+
+          subset_quality <- subset_quality[0, ]
+
+        }
+
+      }
+
+
+
+      if (use_strahler && nrow(subset_quality) > 0) {
+
+        b_strahler <- b_pt$strahler_val
+
+        if (!is.na(b_strahler)) {
+
+          subset_quality <- subset_quality %>% filter(!is.na(strahler_val), abs(strahler_val - b_strahler) <= 1)
+
+        } else {
+
+          subset_quality <- subset_quality[0, ]
+
+        }
+
+      }
+
+
+
+      # Filter op tijd
+
+      if (nrow(subset_quality) > 0) {
+
+        subset_quality <- subset_quality %>%
+
+          mutate(
+
+            temp_diff_days = as.numeric(difftime(b_date, .[[col_date_quality]], units = "days")),
+
+            abs_time_diff  = abs(temp_diff_days)
+
+          ) %>%
+
+          filter(temp_diff_days >= -days_after & temp_diff_days <= days_before)
+
+      }
+
+
+
+      if (nrow(subset_quality) > 0) {
+
+
+
+        # STAP 2: Bereken afstanden (Graaf EN Euclidisch)
+
+
+
+        # A. Graaf Afstand (alleen upstream werkt hier, downstream geeft Inf)
+
+        upstream_nodes <- names(subcomponent(g, v = b_node, mode = "in"))
+
+        subset_quality$is_upstream <- subset_quality$node_id %in% upstream_nodes
+
+
+
+        # Bereken graafafstand (alleen zinvol voor upstream, maar we runnen voor subset)
+
+        d_matrix <- distances(g, v = subset_quality$node_id, to = b_node, mode = "out")
+
+        subset_quality$graph_dist <- as.numeric(d_matrix)
+
+
+
+        # B. Euclidische Afstand (Vogelvlucht)
+
+        # We moeten de geometry ophalen uit de originele quality_sf
+
+        # Dit doen we via de index die we eerder hebben opgeslagen
+
+        target_geoms <- quality_sf[subset_quality$orig_index_geo, ]
+
+        euclid_dists <- st_distance(b_pt, target_geoms)
+
+        subset_quality$euclid_dist <- as.numeric(euclid_dists)
+
+
+
+        # STAP 3: De 'OR' Filter
+
+        # Kandidaat is geldig als:
+
+        # (Is Upstream EN GraphDist <= 5000) OF (EuclidDist <= 200)
+
+
+
+        candidates <- subset_quality %>%
+
+          filter(
+
+            (is_upstream & graph_dist <= max_dist_m) |
+
+              (euclid_dist <= max_downstream_m)
+
+          )
+
+
+
+        # STAP 4: Bepaal de 'definitive' afstand voor sortering
+
+        # Als het upstream is -> Graph dist
+
+        # Als het downstream is (graph=Inf) -> Euclid dist
+
+        # Als het beide is (kortbij upstream) -> Graph dist (consistentie)
+
+        if (nrow(candidates) > 0) {
+
+          candidates$river_dist_m <- ifelse(is.finite(candidates$graph_dist),
+
+                                            candidates$graph_dist,
+
+                                            candidates$euclid_dist)
+
+
+
+          # Topology check (Lozingen) - enkel relevant voor upstream paden!
+
+          # Als een punt downstream ligt, heeft een lozing stroomopwaarts (tussen biota en qual) geen invloed op qual.
+
+          if (length(discharge_nodes) > 0) {
+
+            # We checken alleen de kandidaten die 'upstream' zijn volgens de graaf
+
+            to_check_idx <- which(candidates$is_upstream & candidates$river_dist_m > 0)
+
+
+
+            if(length(to_check_idx) > 0) {
+
+              keep_flags <- rep(TRUE, nrow(candidates))
+
+
+
+              checks <- sapply(candidates$node_id[to_check_idx], function(cand_node) {
+
+                if (cand_node == b_node) return(TRUE)
+
+                path_res <- shortest_paths(g, from = cand_node, to = b_node, mode = "out")
+
+                intermediate_nodes <- setdiff(names(path_res$vpath[[1]]), c(cand_node, b_node))
+
+                if (any(intermediate_nodes %in% discharge_nodes)) return(FALSE) else return(TRUE)
+
+              })
+
+
+
+              keep_flags[to_check_idx] <- checks
+
+              candidates <- candidates[keep_flags, ]
+
+            }
+
+          }
+
+
+
+          candidates_within <- candidates # Naamgeving consistent houden
+
+
+
+          if (nrow(candidates_within) > 0) {
+
+            # ... (Selectie logica blijft hetzelfde) ...
+
+            if (selection_mode == "closest_distance") {
+
+              match <- candidates_within[which.min(candidates_within$river_dist_m), ]; n_matches_found <- 1
+
+            } else if (selection_mode == "closest_time") {
+
+              match <- candidates_within[which.min(candidates_within$abs_time_diff), ]; n_matches_found <- 1
+
+            } else if (selection_mode == "all") {
+
+              match <- candidates_within; n_matches_found <- nrow(candidates_within)
+
+            } else if (selection_mode == "aggregate") {
+
+              n_matches_found <- nrow(candidates_within)
+
+              if (!is.null(aggr_cols)) { cols_to_agg <- aggr_cols } else {
+
+                tech_cols <- c("node_id", "river_dist_m", "temp_diff_days", "abs_time_diff", "strahler_val", "match_group_val", "orig_index_geo", "graph_dist", "euclid_dist", "is_upstream")
+
+                num_cols <- names(select_if(candidates_within, is.numeric))
+
+                cols_to_agg <- setdiff(num_cols, tech_cols)
+
+              }
+
+              agg_fun <- switch(aggr_method, "mean"=function(x) mean(x, na.rm=T), "min"=function(x) min(x, na.rm=T), "max"=function(x) max(x, na.rm=T))
+
+
+
+              if (length(cols_to_agg) > 0) {
+
+                agg_values <- candidates_within %>% summarise(across(all_of(cols_to_agg), agg_fun))
+
+                match <- candidates_within[1, ]
+
+                match[, cols_to_agg] <- agg_values
+
+              } else { match <- candidates_within[1, ] }
+
+              match$river_dist_m <- mean(candidates_within$river_dist_m)
+
+            }
+
+          }
+
+        }
+
+      }
+
+      if (!is.data.frame(match)) { match <- quality_df[1, ]; match[] <- NA; match$river_dist_m <- NA }
+
+    }
+
+    match$biota_match_id <- b_id
+
+    match$n_matches <- n_matches_found
+
+    # Cleanup extra kolommen
+
+    cols_to_remove <- c("temp_diff_days", "abs_time_diff", "match_group_val", "strahler_val", "orig_index_geo", "graph_dist", "euclid_dist", "is_upstream")
+
+    match[, base::intersect(names(match), cols_to_remove)] <- NULL
+
+    results[[i]] <- match
+
+  }
+
+
+
+  message("3/5 Merging results...")
+
+  matched_quality_df <- do.call(rbind, results)
+
+  cols_to_rename <- setdiff(names(matched_quality_df), "biota_match_id")
+
+  names(matched_quality_df)[names(matched_quality_df) %in% cols_to_rename] <- paste0("qual_", cols_to_rename)
+
+  final_sf <- left_join(biota_sf, matched_quality_df, by = c("tmp_join_id" = "biota_match_id"))
+
+
+
+  final_sf$tmp_join_id <- NULL
+
+  if("match_group_val" %in% names(final_sf)) final_sf$match_group_val <- NULL
+
+  if("strahler_val" %in% names(final_sf)) final_sf$strahler_val <- NULL
+
+
+
+  return(final_sf)
+
+}
+
+
+
+kan je mijn R code en functie aanpassen voor het volgende te doen. In plaats van koppelen van MI met quality punten geeft ik een laag met observaties van beekprik over verschillende jaren. nu wil ik op basis van die observaties voor bepaalde tijdsvensters die te specifieren zijn alle segmenten hebben die op x km van een observatie liggen om zo te komen tot areaalclusters (multilinestring) van beekprik.
+
+Gemini zei
+Dit is een heel interessante verschuiving in je logica! In plaats van een point-to-point koppeling (Biota → Quality), wil je nu een point-to-network analyse doen. Je wilt feitelijk een stroomopwaartse en stroomafwaartse "buffer" (of isochroon) over je waterloopnetwerk leggen rondom je observaties om zo tot aaneengesloten habitatclusters te komen.
+
+Omdat je met ruim 164.000 segmenten werkt, is efficiëntie hier de sleutel. In plaats van voor elke observatie apart het netwerk af te speuren en dan alles samen te voegen, kunnen we de igraph afstandsberekening optimaliseren door in één keer de hele matrix te berekenen en de verbonden componenten (clusters) op te sporen.
+
+Hier is de aangepaste R functie get_beekprik_clusters. Ik heb de functie zo geschreven dat hij niet alleen de segmenten selecteert, maar ook ruimtelijk gescheiden clusters identificeert en deze netjes samenvoegt tot afzonderlijke MULTILINESTRING features.
+
+De R Functie: get_beekprik_clusters
+R
+get_beekprik_clusters <- function(observations_sf, 
+                                  network_list, 
+                                  target_years = NULL, 
+                                  max_dist_m = 5000, 
+                                  snap_tolerance = 50,
+                                  time_col = "jaar") {
+  
+  message("1/5 Validatie en filteren van de data...")
+  g <- network_list$graph
+  net_sf <- network_list$network_sf
+  
+  # 1. Tijdsfilter toepassen (indien opgegeven)
+  if (!is.null(target_years)) {
+    obs_filtered <- observations_sf %>% filter(.data[[time_col]] %in% target_years)
+  } else {
+    obs_filtered <- observations_sf
+  }
+  
+  if (nrow(obs_filtered) == 0) {
+    warning("Geen observaties gevonden voor de opgegeven criteria.")
+    return(NULL)
+  }
+  
+  message(paste(" ->", nrow(obs_filtered), "observaties geselecteerd voor de analyse."))
+  
+  # 2. Snappen van observaties aan het netwerk
+  message("2/5 Observaties snappen aan de graaf...")
+  nearest_idx <- st_nearest_feature(obs_filtered, net_sf)
+  dists <- st_distance(obs_filtered, net_sf[nearest_idx, ], by_element = TRUE)
+  
+  valid_snaps <- as.numeric(dists) <= snap_tolerance
+  if (sum(valid_snaps) == 0) {
+    warning("Geen enkele observatie lag binnen de snap_tolerance van het netwerk.")
+    return(NULL)
+  }
+  
+  # Haal de unieke startknooppunten op
+  # We gebruiken de from_node van het dichtstbijzijnde segment
+  snapped_nodes <- unique(as.character(net_sf$from_node[nearest_idx[valid_snaps]]))
+  message(paste(" ->", length(snapped_nodes), "unieke netwerk-nodes geïdentificeerd als startpunten."))
+  
+  # 3. Bereken netwerkafstanden
+  message(paste("3/5 Netwerk verkennen (max afstand:", max_dist_m, "m)..."))
+  # mode = "all" is cruciaal: vissen kunnen stroomopwaarts én stroomafwaarts zwemmen
+  # distances() geeft een matrix: Rijen = snapped_nodes, Kolommen = alle nodes in de graaf
+  dist_matrix <- distances(g, v = snapped_nodes, mode = "all")
+  
+  # Voor elke node in de graaf zoeken we de minimale afstand tot EENDER WELKE observatie
+  # apply met MARGIN=2 betekent: voer uit per kolom
+  min_dists <- apply(dist_matrix, 2, min)
+  
+  # Selecteer alle nodes die binnen de drempelwaarde vallen
+  valid_nodes <- colnames(dist_matrix)[is.finite(min_dists) & min_dists <= max_dist_m]
+  
+  # 4. Losse clusters identificeren via een sub-graaf
+  message("4/5 Ruimtelijk gescheiden clusters identificeren...")
+  # We maken een tijdelijke graaf die enkel bestaat uit de bereikbare nodes
+  sub_g <- induced_subgraph(g, valid_nodes)
+  
+  # Bepaal de verbonden componenten (dit zijn onze losse areaalclusters!)
+  comps <- components(sub_g)
+  
+  # Maak een tabelletje met Node ID en bijbehorend Cluster ID
+  node_clusters <- data.frame(
+    node_id = names(comps$membership),
+    cluster_id = as.character(comps$membership)
+  )
+  
+  # 5. Segmenten ophalen en samenvoegen tot MULTILINESTRING
+  message("5/5 Geometrieën samenvoegen (Dissolve)...")
+  
+  # We koppelen de segmenten op basis van de from_node. 
+  # (Omdat elk segment in de sub-graaf verweven is, is dit voldoende)
+  cluster_segments <- net_sf %>%
+    inner_join(node_clusters, by = c("from_node" = "node_id"))
+  
+  # Groepeer per cluster en smelt de geometrieën samen
+  final_clusters_sf <- cluster_segments %>%
+    group_by(cluster_id) %>%
+    summarise(
+      n_segmenten = n(),
+      totale_lengte_km = round(sum(weight) / 1000, 2), # weight was lengte in meters
+      geometry = st_union(geometry), # Smelt lijnen samen
+      .groups = "drop"
+    ) %>%
+    # Zorg dat de output netjes één of meerdere MULTILINESTRINGS zijn
+    st_cast("MULTILINESTRING") 
+  
+  message(paste("Klaar! Er zijn", nrow(final_clusters_sf), "aaneengesloten beekprik-clusters gegenereerd."))
+  
+  return(final_clusters_sf)
+}
+Hoe je dit gebruikt:
+Als je bijvoorbeeld de areaalclusters wil berekenen voor de jaren 2015 tot en met 2023, en je rekent een verspreidingscapaciteit van 3 kilometer (3000 meter) rond de observaties:
+
+R
+# Bereken de clusters (bijv. 3km bereik rondom observaties in recente jaren)
+beekprik_clusters_recent <- get_beekprik_clusters(
+  observations_sf = beekprik, 
+  network_list = river_network_fine, 
+  target_years = 2015:2023,   # Tijdsvenster
+  max_dist_m = 3000,          # 3 kilometer netwerkafstand
+  snap_tolerance = 50,        # Maximale foutmarge om punt op de lijn te plakken
+  time_col = "jaar"
+)
+
+# Visualiseer met mapview
+mapview(beekprik_clusters_recent, zcol = "cluster_id", lwd = 3) + 
+  mapview(beekprik %>% filter(jaar %in% 2015:2023), col.regions = "red")
+Belangrijkste aanpassingen t.o.v. je oude code:
+mode = "all" in distances(): Waterkwaliteit stroomt enkel downstream, maar vissen zwemmen beide kanten op. mode = "all" negeert de stroomrichting van de gerichte graaf voor de berekening van de habitat.
+
+induced_subgraph & components: Dit is een handig igraph trucje. Door alle nodes te selecteren die ≤X km liggen, en daar een nieuwe "minigraaf" van te maken, rekent de functie components() automatisch uit welke delen fysiek aan elkaar vastzitten. Elk geïsoleerd stroomgebied of afgesneden tak krijgt zo een eigen cluster_id.
+
+Group by & st_union: Smelt die duizenden opgeknipt segmentjes van 200m netjes terug samen tot een overzichtelijke MULTILINESTRING dataset.
+
+Zou je ook nog willen dat het resulterende object per cluster aangeeft welke specifieke jaren of populatienamen (naam / populatie uit je dataframe) de oorzaak waren van die cluster, of is puur de geometrie voor nu voldoende?
+
+Jij zei
+kan je aan de functie een argument toevoegen die een cluster onderbreekt indien er een migratieknelpunt aanwezig is? de knelpunten worden ingegeven als sf puntlaag en gesnapt op het netwerk met tolerantie 25m en op basis van "vhas" (in knelpunt object) en "VHAS" in fd object. De knelpuntenlaag bevat voor elk jaar de knelpunten die kunnen verschillen tussen de jaren. Dus moet per jaar aan de beekprik meetpunten worden gelinkt. Natuurlijk krijg je dan misschien een probleem als binnen een periode bvb 2015-2024 er een migratieknelpunt is opgelost in 2020 -> want dan zal die de migratie voorkomen voro de meetpunten voor 2020, maar niet na 2020. Hoe dit aanpakken?
+
+
+
+ head(knelpunten_tijdreeks)
+
+Simple feature collection with 6 features and 11 fields
+
+Geometry type: POINT
+
+Dimension:     XY
+
+Bounding box:  xmin: 191037.4 ymin: 166707.7 xmax: 231146 ymax: 188810.7
+
+Projected CRS: BD72 / Belgian Lambert 72
+
+# A tibble: 6 × 12
+
+  objectid knelpunt_nummer status   datum_laatst_gewijzigd type  vhag  vhas 
+
+  <chr>    <chr>           <chr>    <dttm>                 <chr> <chr> <chr>
+
+1 1088     7151-020        Opgelost 1997-07-17 12:07:00    Wate… 7151  6033…
+
+2 1113     7151-030        Opgelost 1997-07-17 12:07:00    Wate… 7151  6033…
+
+3 518      7151-160        Opgelost 1997-07-17 12:07:00    Wate… 7151  6010…
+
+4 531      7151-170        Opgelost 1997-07-17 12:07:00    Wate… 7151  3601…
+
+5 417      7151-190        Opgelost 1997-07-17 12:07:00    Wate… 7151  3601…
+
+6 982      7152-190        Opgelost 1997-05-05 12:05:00    Wate… 7152  6018…
+
+# ℹ 5 more variables: owl <chr>, geometry <POINT [m]>,
+
+#   jaar_laatst_gewijzigd <dbl>, eindjaar <dbl>, jaar <int>
+
+
+
+als je filtert op jaar haal je alle knelpunten binnen dat jaar op.
+
+Gemini zei
+Dit is een heel scherpe observatie! De topologie (het doorstroombare netwerk) verandert inderdaad door de tijd heen naarmate knelpunten worden opgelost of erbij komen.
+
+Hoe pakken we dit aan?
+De enige correcte manier om dit op te lossen, is door de analyse jaar per jaar te itereren. We maken de netwerkgraaf dynamisch:
+
+We nemen een specifiek jaar (bv. 2020).
+
+We filteren de waarnemingen van 2020.
+
+We filteren de actieve knelpunten in 2020.
+
+We 'knippen' de actieve knelpunten letterlijk uit de netwerkgraaf van dat jaar (igraph::delete_vertices). Hierdoor kan het algoritme onmogelijk stroomopwaarts of -afwaarts door dit punt rekenen.
+
+We berekenen de clusters voor 2020 en slaan deze op.
+
+We herhalen dit voor het volgende jaar (bv. 2021). Is het knelpunt daar opgelost? Dan filtert stap 3 hem niet meer mee, blijft de node in de graaf, en kan de beekprik er in 2021 wél doorheen "zwemmen" in de analyse.
+
+Hier is de volledig aangepaste functie die dit per jaar afhandelt en de hybrid-snapping voor knelpunten integreert.
+
+De Aangepaste R Functie
+R
+get_beekprik_clusters_tijdreeks <- function(observations_sf, 
+                                            network_list, 
+                                            knelpunten_sf = NULL,
+                                            target_years = NULL, 
+                                            max_dist_m = 5000, 
+                                            snap_tolerance_obs = 50,
+                                            snap_tolerance_knelpunt = 25,
+                                            time_col = "jaar",
+                                            vhas_col_knelpunt = "vhas",
+                                            vhas_col_network = "VHAS") {
+  
+  # --- 1. Voorbereiding ---
+  g_base <- network_list$graph
+  net_sf <- network_list$network_sf
+  
+  if (!is.null(target_years)) {
+    observations_sf <- observations_sf %>% filter(.data[[time_col]] %in% target_years)
+  }
+  
+  if (nrow(observations_sf) == 0) {
+    warning("Geen observaties gevonden voor de opgegeven criteria.")
+    return(NULL)
+  }
+  
+  unieke_jaren <- sort(unique(observations_sf[[time_col]]))
+  message(paste("Analyse gestart voor", length(unieke_jaren), "verschillende jaren..."))
+  
+  # Lijst om resultaten per jaar in op te slaan
+  all_clusters <- list()
+  
+  # --- 2. Iteratie per jaar ---
+  for (yr in unieke_jaren) {
+    message(paste0("\n--- Verwerken van jaar: ", yr, " ---"))
+    
+    # A. Data filteren voor huidig jaar
+    obs_yr <- observations_sf %>% filter(.data[[time_col]] == yr)
+    message(paste(" ->", nrow(obs_yr), "observaties."))
+    
+    # B. Observaties snappen
+    idx_obs <- st_nearest_feature(obs_yr, net_sf)
+    dist_obs <- as.numeric(st_distance(obs_yr, net_sf[idx_obs, ], by_element = TRUE))
+    valid_obs <- dist_obs <= snap_tolerance_obs
+    
+    start_nodes <- unique(as.character(net_sf$from_node[idx_obs[valid_obs]]))
+    if (length(start_nodes) == 0) {
+      message(" -> Geen observaties succesvol gesnapt binnen de tolerantie. Overslaan.")
+      next
+    }
+    
+    # C. Knelpunten voor dit jaar bepalen en snappen
+    barrier_nodes <- character(0)
+    
+    if (!is.null(knelpunten_sf)) {
+      knel_yr <- knelpunten_sf %>% filter(.data[[time_col]] == yr)
+      
+      if (nrow(knel_yr) > 0) {
+        snapped_barriers <- character(nrow(knel_yr))
+        
+        for (i in seq_len(nrow(knel_yr))) {
+          k_pt <- knel_yr[i, ]
+          k_vhas <- k_pt[[vhas_col_knelpunt]]
+          match_found <- FALSE
+          
+          # Poging 1: Matchen via VHAS
+          if (!is.na(k_vhas) && k_vhas != "") {
+            net_idx <- which(net_sf[[vhas_col_network]] == k_vhas)
+            if (length(net_idx) > 0) {
+              rel_idx <- st_nearest_feature(k_pt, net_sf[net_idx, ])
+              abs_idx <- net_idx[rel_idx]
+              dist_k <- as.numeric(st_distance(k_pt, net_sf[abs_idx, ]))
+              
+              if (dist_k <= snap_tolerance_knelpunt) {
+                snapped_barriers[i] <- as.character(net_sf$from_node[abs_idx])
+                match_found <- TRUE
+              }
+            }
+          }
+          
+          # Poging 2: Fallback puur geometrisch
+          if (!match_found) {
+            abs_idx <- st_nearest_feature(k_pt, net_sf)
+            dist_k <- as.numeric(st_distance(k_pt, net_sf[abs_idx, ]))
+            if (dist_k <= snap_tolerance_knelpunt) {
+              snapped_barriers[i] <- as.character(net_sf$from_node[abs_idx])
+            } else {
+              snapped_barriers[i] <- NA
+            }
+          }
+        }
+        
+        barrier_nodes <- unique(na.omit(snapped_barriers))
+        message(paste(" ->", length(barrier_nodes), "actieve migratieknelpunten succesvol gesnapt."))
+      } else {
+        message(" -> Geen actieve migratieknelpunten in dit jaar.")
+      }
+    }
+    
+    # D. Graaf aanpassen voor het huidige jaar
+    # Let op: als een observatie *exact* op een knelpunt valt, halen we die start_node eruit 
+    # anders faalt het algoritme. Hij verspreidt dan niet.
+    start_nodes <- setdiff(start_nodes, barrier_nodes)
+    
+    if (length(start_nodes) == 0) {
+      message(" -> Alle startpunten vallen exact op een knelpunt en zijn geblokkeerd. Overslaan.")
+      next
+    }
+    
+    # Verwijder de knooppunten uit de graaf. Hierdoor is de verbinding daar definitief doorgeknipt.
+    g_yr <- g_base
+    if (length(barrier_nodes) > 0) {
+      # igraph filtert op vertex names
+      nodes_to_delete <- V(g_yr)[name %in% barrier_nodes]
+      g_yr <- delete_vertices(g_yr, nodes_to_delete)
+    }
+    
+    # E. Netwerkafstanden en clusters berekenen
+    dist_matrix <- distances(g_yr, v = start_nodes, mode = "all")
+    min_dists <- apply(dist_matrix, 2, min)
+    valid_nodes <- colnames(dist_matrix)[is.finite(min_dists) & min_dists <= max_dist_m]
+    
+    # Componenten bepalen op basis van bereikbare gebieden
+    sub_g <- induced_subgraph(g_yr, valid_nodes)
+    comps <- components(sub_g)
+    
+    node_clusters <- data.frame(
+      node_id = names(comps$membership),
+      cluster_id_temp = as.character(comps$membership)
+    )
+    
+    # F. Samenvoegen tot MULTILINESTRING en jaar toevoegen
+    cluster_segments <- net_sf %>%
+      inner_join(node_clusters, by = c("from_node" = "node_id"))
+    
+    clusters_sf_yr <- cluster_segments %>%
+      group_by(cluster_id_temp) %>%
+      summarise(
+        jaar = yr,
+        n_segmenten = n(),
+        totale_lengte_km = round(sum(weight) / 1000, 2),
+        geometry = st_union(geometry),
+        .groups = "drop"
+      ) %>%
+      mutate(cluster_id = paste0("Y", yr, "_C", cluster_id_temp)) %>%
+      select(cluster_id, jaar, n_segmenten, totale_lengte_km, geometry) %>%
+      st_cast("MULTILINESTRING")
+    
+    all_clusters[[as.character(yr)]] <- clusters_sf_yr
+    message(paste(" ->", nrow(clusters_sf_yr), "clusters gegenereerd voor", yr))
+  }
+  
+  # --- 3. Resultaten bundelen ---
+  if (length(all_clusters) > 0) {
+    final_clusters_sf <- bind_rows(all_clusters)
+    message(paste("\nKlaar! In totaal", nrow(final_clusters_sf), "clusters gegenereerd over alle jaren heen."))
+    return(final_clusters_sf)
+  } else {
+    message("\nKlaar! Geen clusters kunnen genereren.")
+    return(NULL)
+  }
+}
+De logica uitgelegd
+De VHAS/Geometrie Fallback (Stap 2C): Ik heb exact de logica toegepast die je in de vorige iteratie gebruikte. Hij zoekt eerst in de stroomgebieden of de vhas code van het knelpunt ergens te bespeuren valt binnen 25m. Vindt hij niks? Dan valt hij terug op een harde geometrische nabijheidszoektocht.
+
+Tijds-dynamische Graaf (delete_vertices): Dit is de magic trick. Door per tijdsstap (yr) via igraph::delete_vertices de gesnapte knelpunten uit de graaf te slopen, verbreek je de verbinding daar. distances() zal vanaf de beekprik-locatie dat knelpunt bereiken, en dan domweg zien dat de weg stopt (afstand tot de volgende node wordt de facto overschreven met Inf).
+
+Dynamische Cluster ID's: Omdat een cluster in 2019 anders kan zijn dan één in 2020 (bijvoorbeeld door een opgelost knelpunt), krijgt elke gegenereerde cluster een uniek ID op basis van het jaar, bv. Y2019_C1.
+
+Hoe roep je dit aan?
+R
+beekprik_habitat_historiek <- get_beekprik_clusters_tijdreeks(
+  observations_sf = beekprik, 
+  network_list = river_network_fine, 
+  knelpunten_sf = knelpunten_tijdreeks,  # Je nieuwe knelpuntenlaag
+  target_years = 2015:2024,
+  max_dist_m = 3000, 
+  snap_tolerance_obs = 50, 
+  snap_tolerance_knelpunt = 25,          # Strengere snap voor knelpunten
+  time_col = "jaar",
+  vhas_col_knelpunt = "vhas",            # Kolomnaam in je tibble
+  vhas_col_network = "VHAS"              # Kolomnaam in fd
+)
+
+# Kijken naar de evolutie:
+mapview(beekprik_habitat_historiek, zcol = "jaar", burst = TRUE)
+Door burst = TRUE in mapview te gebruiken, krijg je in je viewer een apart vinkje voor elk jaar en zie je prachtig de habitat op je kaart "krimpen" of "groeien" afhankelijk van de knelpunten.
+
+Zou je willen dat we van dit eindresultaat ook nog een samenvattende tabel maken die per jaar aangeeft hoeveel beekprik-habitat er beschikbaar is voor heel Vlaanderen?
+
+Jij zei
+De VHAS/Geometrie Fallback (Stap 2C): Ik heb exact de logica toegepast die je in de vorige iteratie gebruikte. Hij zoekt eerst in de stroomgebieden of de vhas code van het knelpunt ergens te bespeuren valt binnen 25m. Vindt hij niks? Dan valt hij terug op een harde geometrische nabijheidszoektocht. _> in eerste instantie is het snappen op de vhas code (zonder tolerantie, gewoon dichtst snappen) indien niet mogelijk op vhas code -> dichtste waterloop snappen.
+
+Gemini zei
+Ah, duidelijk! Dat is inderdaad een robuustere manier als je er zeker van wilt zijn dat elk knelpunt altijd effectief op het netwerk terechtkomt, zonder dat een strenge afstandstolerantie per ongeluk knelpunten laat wegvallen.
+
+We halen de afstandstolerantie voor de knelpunten er volledig uit. De logica wordt nu:
+
+Zoek alle segmenten met dezelfde VHAS-code. Bestaan die? Neem dan het segment dat geometrisch het dichtstbij ligt (al is dat 100 meter verderop).
+
+Bestaat de VHAS-code niet (of is deze NA)? Neem dan gewoon het absoluut dichtstbijzijnde segment uit het héle netwerk.
+
+Hieronder vind je de aangepaste functie. Ik heb het argument snap_tolerance_knelpunt verwijderd en "Stap 2C" in de code herschreven naar jouw nieuwe logica.
+
+De aangepaste R Functie
+R
+get_beekprik_clusters_tijdreeks <- function(observations_sf, 
+                                            network_list, 
+                                            knelpunten_sf = NULL,
+                                            target_years = NULL, 
+                                            max_dist_m = 5000, 
+                                            snap_tolerance_obs = 50,
+                                            time_col = "jaar",
+                                            vhas_col_knelpunt = "vhas",
+                                            vhas_col_network = "VHAS") {
+  
+  # --- 1. Voorbereiding ---
+  g_base <- network_list$graph
+  net_sf <- network_list$network_sf
+  
+  if (!is.null(target_years)) {
+    observations_sf <- observations_sf %>% filter(.data[[time_col]] %in% target_years)
+  }
+  
+  if (nrow(observations_sf) == 0) {
+    warning("Geen observaties gevonden voor de opgegeven criteria.")
+    return(NULL)
+  }
+  
+  unieke_jaren <- sort(unique(observations_sf[[time_col]]))
+  message(paste("Analyse gestart voor", length(unieke_jaren), "verschillende jaren..."))
+  
+  all_clusters <- list()
+  
+  # --- 2. Iteratie per jaar ---
+  for (yr in unieke_jaren) {
+    message(paste0("\n--- Verwerken van jaar: ", yr, " ---"))
+    
+    # A. Data filteren voor huidig jaar
+    obs_yr <- observations_sf %>% filter(.data[[time_col]] == yr)
+    message(paste(" ->", nrow(obs_yr), "observaties."))
+    
+    # B. Observaties snappen (deze behouden wel de tolerantie)
+    idx_obs <- st_nearest_feature(obs_yr, net_sf)
+    dist_obs <- as.numeric(st_distance(obs_yr, net_sf[idx_obs, ], by_element = TRUE))
+    valid_obs <- dist_obs <= snap_tolerance_obs
+    
+    start_nodes <- unique(as.character(net_sf$from_node[idx_obs[valid_obs]]))
+    if (length(start_nodes) == 0) {
+      message(" -> Geen observaties succesvol gesnapt binnen de tolerantie. Overslaan.")
+      next
+    }
+    
+    # C. Knelpunten voor dit jaar bepalen en snappen (NIEUWE LOGICA)
+    barrier_nodes <- character(0)
+    
+    if (!is.null(knelpunten_sf)) {
+      knel_yr <- knelpunten_sf %>% filter(.data[[time_col]] == yr)
+      
+      if (nrow(knel_yr) > 0) {
+        snapped_barriers <- character(nrow(knel_yr))
+        
+        for (i in seq_len(nrow(knel_yr))) {
+          k_pt <- knel_yr[i, ]
+          k_vhas <- k_pt[[vhas_col_knelpunt]]
+          match_found <- FALSE
+          
+          # Poging 1: Matchen via VHAS (gewoon dichtstbijzijnde binnen de subset)
+          if (!is.na(k_vhas) && k_vhas != "") {
+            net_idx <- which(net_sf[[vhas_col_network]] == k_vhas)
+            if (length(net_idx) > 0) {
+              # Zoek relatieve index binnen de subset van matchende VHAS
+              rel_idx <- st_nearest_feature(k_pt, net_sf[net_idx, ])
+              # Vertaal terug naar absolute index in de volledige net_sf
+              abs_idx <- net_idx[rel_idx]
+              
+              snapped_barriers[i] <- as.character(net_sf$from_node[abs_idx])
+              match_found <- TRUE
+            }
+          }
+          
+          # Poging 2: Fallback puur geometrisch (dichtste waterloop tout court)
+          if (!match_found) {
+            abs_idx <- st_nearest_feature(k_pt, net_sf)
+            snapped_barriers[i] <- as.character(net_sf$from_node[abs_idx])
+          }
+        }
+        
+        barrier_nodes <- unique(na.omit(snapped_barriers))
+        message(paste(" ->", length(barrier_nodes), "actieve migratieknelpunten succesvol gesnapt."))
+      } else {
+        message(" -> Geen actieve migratieknelpunten in dit jaar.")
+      }
+    }
+    
+    # D. Graaf aanpassen voor het huidige jaar
+    start_nodes <- setdiff(start_nodes, barrier_nodes)
+    
+    if (length(start_nodes) == 0) {
+      message(" -> Alle startpunten vallen exact op een knelpunt en zijn geblokkeerd. Overslaan.")
+      next
+    }
+    
+    g_yr <- g_base
+    if (length(barrier_nodes) > 0) {
+      nodes_to_delete <- V(g_yr)[name %in% barrier_nodes]
+      g_yr <- delete_vertices(g_yr, nodes_to_delete)
+    }
+    
+    # E. Netwerkafstanden en clusters berekenen
+    dist_matrix <- distances(g_yr, v = start_nodes, mode = "all")
+    min_dists <- apply(dist_matrix, 2, min)
+    valid_nodes <- colnames(dist_matrix)[is.finite(min_dists) & min_dists <= max_dist_m]
+    
+    sub_g <- induced_subgraph(g_yr, valid_nodes)
+    comps <- components(sub_g)
+    
+    node_clusters <- data.frame(
+      node_id = names(comps$membership),
+      cluster_id_temp = as.character(comps$membership)
+    )
+    
+    # F. Samenvoegen tot MULTILINESTRING en jaar toevoegen
+    cluster_segments <- net_sf %>%
+      inner_join(node_clusters, by = c("from_node" = "node_id"))
+    
+    clusters_sf_yr <- cluster_segments %>%
+      group_by(cluster_id_temp) %>%
+      summarise(
+        jaar = yr,
+        n_segmenten = n(),
+        totale_lengte_km = round(sum(weight) / 1000, 2),
+        geometry = st_union(geometry),
+        .groups = "drop"
+      ) %>%
+      mutate(cluster_id = paste0("Y", yr, "_C", cluster_id_temp)) %>%
+      select(cluster_id, jaar, n_segmenten, totale_lengte_km, geometry) %>%
+      st_cast("MULTILINESTRING")
+    
+    all_clusters[[as.character(yr)]] <- clusters_sf_yr
+    message(paste(" ->", nrow(clusters_sf_yr), "clusters gegenereerd voor", yr))
+  }
+  
+  # --- 3. Resultaten bundelen ---
+  if (length(all_clusters) > 0) {
+    final_clusters_sf <- bind_rows(all_clusters)
+    message(paste("\nKlaar! In totaal", nrow(final_clusters_sf), "clusters gegenereerd over alle jaren heen."))
+    return(final_clusters_sf)
+  } else {
+    message("\nKlaar! Geen clusters kunnen genereren.")
+    return(NULL)
+  }
+}
+Met deze logica heb je de garantie dat elk actief knelpunt in dat jaar daadwerkelijk een "cut" maakt in de bereikbaarheidsgraaf, zonder dat afwijkingen in de geografische coördinaten van het knelpunt de analyse verstoren.
+
+Zijn er nog andere uitzonderingen waar we rekening mee moeten houden (bijvoorbeeld knelpunten die slechts gedeeltelijk passeerbaar zijn)?
+
+Jij zei
+normaal dat dit heel lang duurt per jaar?
+
+Gemini zei
+Ja, dat is volkomen normaal, maar het kan gelukkig een pak sneller!
+
+Je vraagt momenteel heel veel van R. Om je een idee te geven van wat er onder de motorkap gebeurt: je hebt een netwerk van 164.456 segmenten. Als je voor een bepaald jaar bijvoorbeeld 50 beekprik-waarnemingen hebt, berekende de vorige functie een matrix van 50 rijen en 164.456 kolommen (dus meer dan 8 miljoen afstanden) om daar dan het minimum uit te zoeken. Tel daarbij op dat het ruimtelijk vastklikken (st_nearest_feature) van knelpunten rij per rij in een loop gebeurde tegen dat gigantische netwerk, én dat het samensmelten van geometrieën (st_union) zwaar is.
+
+Ik heb de code hieronder flink geoptimaliseerd met twee grote trucs:
+
+Vectorisatie van de knelpunten: In plaats van het hele netwerk rij per rij af te speuren voor elk knelpunt, doet hij de geometrische "fallback" nu voor álle knelpunten in één klap. Dat scheelt seconden tot minuten per jaar.
+
+De "Super Node" truc (Graaf-theorie): In plaats van alle afstanden vanaf élke observatie afzonderlijk te berekenen, voeg ik tijdelijk een onzichtbaar centraal knooppunt toe dat met afstand 0 verbonden is aan al je observaties. Het netwerk hoeft nu maar 1 keer te rekenen vanaf dat knooppunt, in plaats van 50 keer. Dit haalt de rekentijd voor het netwerk drastisch naar beneden.
+
+Hier is de geoptimaliseerde versie. Probeer deze eens, je zou een enorm verschil in snelheid moeten merken:
+
+R
+get_beekprik_clusters_tijdreeks_fast <- function(observations_sf, 
+                                                 network_list, 
+                                                 knelpunten_sf = NULL,
+                                                 target_years = NULL, 
+                                                 max_dist_m = 5000, 
+                                                 snap_tolerance_obs = 50,
+                                                 time_col = "jaar",
+                                                 vhas_col_knelpunt = "vhas",
+                                                 vhas_col_network = "VHAS") {
+  
+  # --- 1. Voorbereiding ---
+  g_base <- network_list$graph
+  net_sf <- network_list$network_sf
+  
+  if (!is.null(target_years)) {
+    observations_sf <- observations_sf %>% filter(.data[[time_col]] %in% target_years)
+  }
+  
+  if (nrow(observations_sf) == 0) return(NULL)
+  
+  unieke_jaren <- sort(unique(observations_sf[[time_col]]))
+  message(sprintf("Analyse gestart voor %d jaren...", length(unieke_jaren)))
+  
+  all_clusters <- list()
+  
+  # --- 2. Iteratie per jaar ---
+  for (yr in unieke_jaren) {
+    message(paste0("\n--- Verwerken van jaar: ", yr, " ---"))
+    
+    # A. Data filteren voor huidig jaar
+    obs_yr <- observations_sf %>% filter(.data[[time_col]] == yr)
+    
+    # B. Observaties snappen
+    idx_obs <- st_nearest_feature(obs_yr, net_sf)
+    dist_obs <- as.numeric(st_distance(obs_yr, net_sf[idx_obs, ], by_element = TRUE))
+    valid_obs <- dist_obs <= snap_tolerance_obs
+    
+    start_nodes <- unique(as.character(net_sf$from_node[idx_obs[valid_obs]]))
+    if (length(start_nodes) == 0) {
+      message(" -> Geen observaties gesnapt binnen tolerantie. Overslaan.")
+      next
+    }
+    
+    # C. Knelpunten supersnel snappen (Vectorised)
+    barrier_nodes <- character(0)
+    if (!is.null(knelpunten_sf)) {
+      knel_yr <- knelpunten_sf %>% filter(.data[[time_col]] == yr)
+      
+      if (nrow(knel_yr) > 0) {
+        # Stap 1: Doe de geometrische fallback voor ALLES tegelijk in 1 bewerking (razendsnel)
+        fallback_idx <- st_nearest_feature(knel_yr, net_sf)
+        snapped_barriers <- as.character(net_sf$from_node[fallback_idx])
+        
+        # Stap 2: Overschrijf enkel degene met een geldige VHAS-match
+        # (Dit is snel omdat we enkel zoeken binnen een piepkleine subset van het netwerk)
+        for (i in seq_len(nrow(knel_yr))) {
+          k_vhas <- knel_yr[[vhas_col_knelpunt]][i]
+          if (!is.na(k_vhas) && k_vhas != "") {
+            net_idx <- which(net_sf[[vhas_col_network]] == k_vhas)
+            if (length(net_idx) > 0) {
+              rel_idx <- st_nearest_feature(knel_yr[i, ], net_sf[net_idx, ])
+              snapped_barriers[i] <- as.character(net_sf$from_node[net_idx[rel_idx]])
+            }
+          }
+        }
+        barrier_nodes <- unique(na.omit(snapped_barriers))
+        message(paste(" ->", length(barrier_nodes), "knelpunten gesnapt."))
+      }
+    }
+    
+    # D. Graaf knippen
+    start_nodes <- setdiff(start_nodes, barrier_nodes)
+    if (length(start_nodes) == 0) {
+      message(" -> Alle startpunten geblokkeerd. Overslaan.")
+      next
+    }
+    
+    g_yr <- g_base
+    if (length(barrier_nodes) > 0) {
+      nodes_to_delete <- V(g_yr)[name %in% barrier_nodes]
+      g_yr <- delete_vertices(g_yr, nodes_to_delete)
+    }
+    
+    # E. SUPER NODE TRICK voor snelle routeberekening
+    # Voeg een dummy node toe en verbind hem met afstand 0 aan alle start_nodes
+    g_yr <- add_vertices(g_yr, 1, name = "SUPER_START")
+    edges_to_add <- as.vector(rbind("SUPER_START", start_nodes))
+    g_yr <- add_edges(g_yr, edges_to_add, weight = 0)
+    
+    # Reken nu 1 keer de afstanden uit vanaf de SUPER_START. Dit elimineert de matrix-berekening!
+    dist_vector <- distances(g_yr, v = "SUPER_START", mode = "all")[1, ]
+    
+    # Filter de nodes die binnen de afstand vallen (en gooi de SUPER_START er weer uit)
+    valid_nodes <- names(dist_vector)[dist_vector <= max_dist_m & names(dist_vector) != "SUPER_START"]
+    
+    # F. Samenvoegen tot MULTILINESTRING
+    message(paste(" -> Geometry samenvoegen (bereik:", length(valid_nodes), "nodes)..."))
+    
+    sub_g <- induced_subgraph(g_yr, valid_nodes)
+    comps <- components(sub_g)
+    
+    node_clusters <- data.frame(
+      node_id = names(comps$membership),
+      cluster_id_temp = as.character(comps$membership)
+    )
+    
+    cluster_segments <- net_sf %>%
+      inner_join(node_clusters, by = c("from_node" = "node_id"))
+    
+    clusters_sf_yr <- cluster_segments %>%
+      group_by(cluster_id_temp) %>%
+      summarise(
+        jaar = yr,
+        n_segmenten = n(),
+        totale_lengte_km = round(sum(weight) / 1000, 2),
+        geometry = st_union(geometry),
+        .groups = "drop"
+      ) %>%
+      mutate(cluster_id = paste0("Y", yr, "_C", cluster_id_temp)) %>%
+      select(cluster_id, jaar, n_segmenten, totale_lengte_km, geometry) %>%
+      st_cast("MULTILINESTRING")
+    
+    all_clusters[[as.character(yr)]] <- clusters_sf_yr
+  }
+  
+  # --- 3. Resultaten bundelen ---
+  if (length(all_clusters) > 0) {
+    final_clusters_sf <- bind_rows(all_clusters)
+    message(paste("\nKlaar! In totaal", nrow(final_clusters_sf), "clusters gegenereerd."))
+    return(final_clusters_sf)
+  } else {
+    return(NULL)
+  }
+}
+Als het nu nog steeds traag aanvoelt op jouw machine, dan is de kans groot dat het inruilen van honderden lijnstukjes tot één strakke lijn via st_union() de boosdoener is. Laat het even weten als dat het geval is, dan kunnen we daar ook nog een slimmigheidje op toepassen!
+
+Jij zei
+hoe snapt die de knelpunten nu?
+
+Gemini zei
+Goede vraag! Ik heb de logica in die snelle code eigenlijk "binnenstebuiten" gedraaid om het razendsnel te maken, maar het eindresultaat volgt exact jouw gewenste regel: VHAS krijgt altijd absolute voorrang, en als dat faalt, snapt hij naar de dichtstbijzijnde waterloop.
+
+Om R niet te overbelasten, doet de code dit nu in twee stappen:
+
+Stap 1: De "blinde" geometrische fallback (alles tegelijk)
+In plaats van punt per punt te kijken, pakt de code eerst alle knelpunten van dat jaar en plakt ze in één massale, blinde actie op de geografisch dichtstbijzijnde waterloop (st_nearest_feature(knel_yr, net_sf)). R kan dit extreem snel omdat hij het voor de hele vector tegelijk berekent.
+Resultaat na stap 1: Elk knelpunt heeft nu een 'voorlopig' adres gekregen, puur gebaseerd op vogelvluchtafstand (jouw fallback).
+
+Stap 2: De precieze VHAS-overschrijving (de correctie)
+Daarna loopt de code wél even snel, één voor één, de lijst met knelpunten af om te kijken of we die voorlopige gok moeten corrigeren:
+
+Heeft dit knelpunt een VHAS-code ingevuld?
+
+Zo ja, zoek dan in het grote netwerk enkel en alleen naar de segmenten met die exacte VHAS-code.
+
+Als hij die vindt, berekent hij welk van die specifieke VHAS-segmenten het dichtstbij ligt.
+
+Vervolgens overschrijft hij het voorlopige antwoord uit Stap 1 met deze veel specifiekere VHAS-match.
+
+Wat gebeurt er dus netto met een knelpunt?
+Scenario A (Perfecte wereld): Je knelpunt heeft VHAS '1234'. De code zoekt alle segmenten met VHAS '1234', kiest het segment dat ruimtelijk het dichtstbij ligt, en snapt het knelpunt daaraan vast.
+
+Scenario B (Foute/Ontbrekende VHAS): Je knelpunt heeft geen VHAS (of een code die nergens in de rivier-shapefile voorkomt). Stap 2 kan niks vinden, dus hij laat het antwoord uit Stap 1 gewoon staan. Het knelpunt kleeft dan vast aan de absoluut dichtstbijzijnde waterloop, ongeacht de naam of code.
+
+Door de trage fallback-berekening (die tegen 164.000 segmenten moet rekenen) in één keer (gevectoriseerd) uit te voeren, bespaar je R een loop waarin hij duizenden keren die zware berekening moet doen. Stap 2 is supersnel omdat hij daar nog maar hoeft te rekenen met het handjevol segmenten dat een specifieke VHAS-code deelt.
+
+Jij zei
+eerst op VHAS code om vervolgens met een tolerantie van 25m te snappen?
+
+Gemini zei
+Ah, excuus! In je vorige bericht zei je "zonder tolerantie, gewoon dichtst snappen", dus ik had de 25m grens er in de snelle versie helemaal uitgehaald.
+
+Als ik je nu goed begrijp, wil je exact dit:
+
+Prioriteit 1: Zoek de waterloop met de juiste VHAS-code.
+
+Check: Ligt die waterloop met de juiste VHAS-code binnen 25 meter?
+
+Ja: Snap daaraan vast.
+
+Nee (of VHAS bestaat niet): Negeer de VHAS en snap gewoon aan de absoluut dichtstbijzijnde waterloop (ongeacht hoever die ligt).
+
+Dat is perfect mogelijk en nog steeds razendsnel. We hoeven alleen maar een afstandscheck (st_distance) toe te voegen in die tweede stap.
+
+Je kunt het blok C in de geoptimaliseerde code vervangen door dit stukje:
+
+R
+    # C. Knelpunten supersnel snappen
+    barrier_nodes <- character(0)
+    if (!is.null(knelpunten_sf)) {
+      knel_yr <- knelpunten_sf %>% filter(.data[[time_col]] == yr)
+      
+      if (nrow(knel_yr) > 0) {
+        # Stap 1: De blinde fallback (zonder tolerantie, gewoon de aller-dichtstbijzijnde)
+        fallback_idx <- st_nearest_feature(knel_yr, net_sf)
+        snapped_barriers <- as.character(net_sf$from_node[fallback_idx])
+        
+        # Stap 2: VHAS check mét 25m tolerantie
+        for (i in seq_len(nrow(knel_yr))) {
+          k_vhas <- knel_yr[[vhas_col_knelpunt]][i]
+          
+          if (!is.na(k_vhas) && k_vhas != "") {
+            net_idx <- which(net_sf[[vhas_col_network]] == k_vhas)
+            
+            if (length(net_idx) > 0) {
+              # Zoek dichtstbijzijnde segment BINNEN de correcte VHAS
+              rel_idx <- st_nearest_feature(knel_yr[i, ], net_sf[net_idx, ])
+              abs_idx <- net_idx[rel_idx]
+              
+              # Bereken de afstand tot deze specifieke VHAS-waterloop
+              dist_vhas <- as.numeric(st_distance(knel_yr[i, ], net_sf[abs_idx, ]))
+              
+              # Overschrijf de fallback ENKEL als de VHAS-waterloop <= 25m ligt
+              if (dist_vhas <= 25) {
+                snapped_barriers[i] <- as.character(net_sf$from_node[abs_idx])
+              }
+              # Ligt hij verder dan 25m? Dan doet hij niks en blijft 
+              # het antwoord uit Stap 1 (de dichtstbijzijnde waterloop) gewoon staan.
+            }
+          }
+        }
+        barrier_nodes <- unique(na.omit(snapped_barriers))
+        message(paste(" ->", length(barrier_nodes), "knelpunten gesnapt."))
+      }
+    }
+Waarom is dit veilig en snel?
+
+Omdat de afstand st_distance hier enkel wordt berekend tussen 1 specifiek knelpunt en 1 specifiek netwerksegment (het resultaat van st_nearest_feature binnen de VHAS subset). Dit kost R letterlijk een fractie van een milliseconde.
+
+Het zware rekenwerk (Stap 1, waar hij het dichtstbijzijnde segment in het hele netwerk moet zoeken) gebeurt nog steeds in één klap voor alle knelpunten tegelijk.
+
+Is dit de logica die je zocht?
+
+Jij zei
+nee! 1 zoek waterloop met vhas code -> snap daarop ongeacht hoe ver. 2 vind je geen vhas match _> snap naar dichtstbijzijndste waterloop met maximum 25m afstand
+
+Gemini zei
+Ah, mijn excuses, ik had het precies verkeerd om begrepen! Dat is inderdaad een heel andere (en logischere) regel voor waterlopen: als we weten dat het knelpunt op die specifieke waterloop (VHAS) ligt, plakken we hem daarop, ongeacht een meetfout in de coördinaten. Pas als we écht geen idee hebben (geen VHAS match), zoeken we blind in de buurt, maar dan mogen we niet te ver afwijken (max 25m).
+
+Hier is het gecorrigeerde blok C, waarbij ik de rekenkracht nog steeds geoptimaliseerd houd door de ruimtelijke berekeningen slim te combineren.
+
+Vervang het eerdere C. gedeelte door dit blok:
+
+R
+    # C. Knelpunten supersnel snappen (Correcte Logica)
+    barrier_nodes <- character(0)
+    
+    if (!is.null(knelpunten_sf)) {
+      knel_yr <- knelpunten_sf %>% filter(.data[[time_col]] == yr)
+      
+      if (nrow(knel_yr) > 0) {
+        snapped_barriers <- rep(NA_character_, nrow(knel_yr))
+        
+        # Stap 1: Bereken de geometrische fallback voor ALLES in één keer (dit is het zware rekenwerk)
+        fallback_idx <- st_nearest_feature(knel_yr, net_sf)
+        fallback_dist <- as.numeric(st_distance(knel_yr, net_sf[fallback_idx, ], by_element = TRUE))
+        valid_fallback <- fallback_dist <= 25 # Tolerantie van max 25m voor de fallback
+        
+        # Stap 2: Pas jouw specifieke regels toe per knelpunt
+        for (i in seq_len(nrow(knel_yr))) {
+          k_vhas <- knel_yr[[vhas_col_knelpunt]][i]
+          match_found_via_vhas <- FALSE
+          
+          # Regel 1: Probeer te matchen op VHAS
+          if (!is.na(k_vhas) && k_vhas != "") {
+            net_idx <- which(net_sf[[vhas_col_network]] == k_vhas)
+            
+            if (length(net_idx) > 0) {
+              # Zoek dichtstbijzijnde segment BINNEN de correcte VHAS
+              rel_idx <- st_nearest_feature(knel_yr[i, ], net_sf[net_idx, ])
+              abs_idx <- net_idx[rel_idx]
+              
+              # Snap hierop, ONGEACHT de afstand
+              snapped_barriers[i] <- as.character(net_sf$from_node[abs_idx])
+              match_found_via_vhas <- TRUE
+            }
+          }
+          
+          # Regel 2: Geen VHAS match gevonden? Gebruik de fallback (mét 25m restrictie)
+          if (!match_found_via_vhas) {
+            if (valid_fallback[i]) {
+              snapped_barriers[i] <- as.character(net_sf$from_node[fallback_idx[i]])
+            } else {
+              # Ligt verder dan 25m en geen VHAS? Dan vervalt dit knelpunt
+              snapped_barriers[i] <- NA 
+            }
+          }
+        }
+        
+        barrier_nodes <- unique(na.omit(snapped_barriers))
+        message(paste(" ->", length(barrier_nodes), "knelpunten succesvol gesnapt."))
+      } else {
+        message(" -> Geen actieve migratieknelpunten in dit jaar.")
+      }
+    }
+Waarom dit perfect werkt en snel is:
+Regel 1 wordt gerespecteerd: Hij kijkt eerst naar de VHAS. Is die er? Dan zoekt hij de dichtstbijzijnde geometrie die die code draagt en plakt hem vast zonder te kijken naar afstanden.
+
+Regel 2 wordt gerespecteerd: Faalt de VHAS? Dan kijkt hij of de absoluut dichtstbijzijnde waterloop binnen 25m ligt. Zo ja, snappen. Zo nee, dan wordt het knelpunt genegeerd (NA).
+
+Snelheid: De zware berekening van de absoluut dichtstbijzijnde waterlopen en hun afstanden wordt helemaal bovenaan vectorieel uitgevoerd (fallback_idx en fallback_dist). In de loop haalt hij die waarden gewoon op in plaats van ze duizenden keren opnieuw te berekenen.
+
+Zal ik de volledige code van de functie nog één keer helemaal samengesteld voor je uitschrijven, zodat je deze direct clean in je script kan kopiëren?
+
+Jij zei
+beekprik_habitat_historiek <- get_beekprik_clusters_tijdreeks_fast(
+
+  observations_sf = beekprik,
+
+  network_list = river_network_fine,
+
+  knelpunten_sf = knelpunten_tijdreeks,  # Je nieuwe knelpuntenlaag
+
+  target_years = 2015,
+
+  max_dist_m = 3000,
+
+  snap_tolerance_obs = 50,
+
+  # snap_tolerance_knelpunt = 25,          # Strengere snap voor knelpunten
+
+  time_col = "jaar",
+
+  vhas_col_knelpunt = "vhas",            # Kolomnaam in je tibble
+
+  vhas_col_network = "VHAS"              # Kolomnaam in fd
+
+)
+
+
+
+dit levert clusters op waar geen aanwezigheid van beekprik is...
+
+Gemini zei
+Ah! Dat is een klassieke instinker, en ik zie in de head(beekprik) die je eerder deelde exact waar het misgaat.
+
+Je dataset bevat een kolom aanwezig (met waarden zoals 1 voor aanwezigheid, en vermoedelijk 0 voor afwezigheid).
+
+De functie pakt momenteel élk punt in de observations_sf dataset als startpunt voor een cluster, dus óók de meetpunten waar géén beekprik is gevonden (de nul-waarnemingen). Daardoor tekent hij nu vrolijk 3 kilometer leefgebied rondom plekken waar de soort juist afwezig was.
+
+De makkelijkste en properste manier om dit op te lossen, is door je dataset te filteren op aanwezigheid vóórdat je hem aan de functie geeft. Zo houd je de functie zelf flexibel voor eventuele andere analyses later.
+
+Probeer de aanroep eens zo te doen:
+
+R
+# 1. Filter eerst enkel de effectieve waarnemingen eruit
+beekprik_aanwezig <- beekprik %>% filter(aanwezig == 1)
+
+# 2. Run de snelle functie op deze gefilterde dataset
+beekprik_habitat_historiek <- get_beekprik_clusters_tijdreeks_fast(
+  observations_sf = beekprik_aanwezig,   # <-- Gebruik de gefilterde set!
+  network_list = river_network_fine,
+  knelpunten_sf = knelpunten_tijdreeks,
+  target_years = 2015,
+  max_dist_m = 3000,
+  snap_tolerance_obs = 50,
+  time_col = "jaar",
+  vhas_col_knelpunt = "vhas",
+  vhas_col_network = "VHAS"
+)
+Als je dit runt, gebruikt hij enkel nog de locaties waar aanwezig == 1 als startpunten voor de graaf-berekening. Lossen we het hier direct mee op?

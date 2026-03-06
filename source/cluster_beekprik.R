@@ -16,7 +16,11 @@ beekprik_aanwezig <- beekprik %>%
 
 mapview(beekprik_aanwezig)
 
-# netwerk bouwen
+knelpunten_tijdreeks <- st_read(dsn = here("data", "verwerkt", "vismigratieknelpunten_tijdsreeks.gpkg"))
+
+#### netwerk bouwen ####
+
+
 
 fd <- st_read(here("data", "ruw", "netwerk", "Flow_direction_coordinates.shp"), quiet = T)
 nodes <- st_read(here("data", "ruw", "netwerk", "vha_network_junctions.shp"), quiet = T)
@@ -93,7 +97,7 @@ split_lines_equal_length <- function(lines_sf, max_length = 200) {
 
   message(paste("Klaar! Resultaat:", nrow(final_sf), "segmenten."))
   return(final_sf)
-}
+} # netwerk verfijnen -> segmenten max 200m
 
 fd_fine <- split_lines_equal_length(fd, max_length = 200)
 
@@ -161,9 +165,7 @@ build_river_network_auto_nodes <- function(lines_sf) {
 
 river_network_fine <- build_river_network_auto_nodes(fd_fine)
 
-head(beekprik)
-
-#
+#### Clusters voor beekprik (zonder migratieknelpunten) ####
 
 get_beekprik_clusters <- function(observations_sf,
                                   network_list,
@@ -282,7 +284,6 @@ beekprik_clusters_15_24_3km <- get_beekprik_clusters(
 
 beekprik_2015_2024 <- beekprik_aanwezig %>% filter(jaar %in% 2015:2024)
 
-
 # Visualiseer met mapview
 mapview(fd) +
   mapview(beekprik_clusters_15_24_3km, zcol = "cluster_id", lwd = 3) +
@@ -295,191 +296,9 @@ mapview(fd) +
 
 ###### methode met migratieknelpunten ######
 
-# deze werkt nog niet naar behoren, of is alleszins super traag.
+# duurt even om te lopen over alle jaren!
 
 get_beekprik_clusters_tijdreeks <- function(observations_sf,
-                                            network_list,
-                                            knelpunten_sf = NULL,
-                                            target_years = NULL,
-                                            max_dist_m = 5000,
-                                            snap_tolerance_obs = 50,
-                                            snap_tolerance_knelpunt = 25,
-                                            time_col = "jaar",
-                                            vhas_col_knelpunt = "vhas",
-                                            vhas_col_network = "VHAS") {
-
-  # --- 1. Voorbereiding ---
-  g_base <- network_list$graph
-  net_sf <- network_list$network_sf
-
-  if (!is.null(target_years)) {
-    observations_sf <- observations_sf %>% filter(.data[[time_col]] %in% target_years)
-  }
-
-  if (nrow(observations_sf) == 0) {
-    warning("Geen observaties gevonden voor de opgegeven criteria.")
-    return(NULL)
-  }
-
-  unieke_jaren <- sort(unique(observations_sf[[time_col]]))
-  message(paste("Analyse gestart voor", length(unieke_jaren), "verschillende jaren..."))
-
-  # Lijst om resultaten per jaar in op te slaan
-  all_clusters <- list()
-
-  # --- 2. Iteratie per jaar ---
-  for (yr in unieke_jaren) {
-    message(paste0("\n--- Verwerken van jaar: ", yr, " ---"))
-
-    # A. Data filteren voor huidig jaar
-    obs_yr <- observations_sf %>% filter(.data[[time_col]] == yr)
-    message(paste(" ->", nrow(obs_yr), "observaties."))
-
-    # B. Observaties snappen
-    idx_obs <- st_nearest_feature(obs_yr, net_sf)
-    dist_obs <- as.numeric(st_distance(obs_yr, net_sf[idx_obs, ], by_element = TRUE))
-    valid_obs <- dist_obs <= snap_tolerance_obs
-
-    start_nodes <- unique(as.character(net_sf$from_node[idx_obs[valid_obs]]))
-    if (length(start_nodes) == 0) {
-      message(" -> Geen observaties succesvol gesnapt binnen de tolerantie. Overslaan.")
-      next
-    }
-
-    # C. Knelpunten supersnel snappen (Correcte Logica)
-    barrier_nodes <- character(0)
-
-    if (!is.null(knelpunten_sf)) {
-      knel_yr <- knelpunten_sf %>% filter(.data[[time_col]] == yr)
-
-      if (nrow(knel_yr) > 0) {
-        snapped_barriers <- rep(NA_character_, nrow(knel_yr))
-
-        # Stap 1: Bereken de geometrische fallback voor ALLES in één keer (dit is het zware rekenwerk)
-        fallback_idx <- st_nearest_feature(knel_yr, net_sf)
-        fallback_dist <- as.numeric(st_distance(knel_yr, net_sf[fallback_idx, ], by_element = TRUE))
-        valid_fallback <- fallback_dist <= 25 # Tolerantie van max 25m voor de fallback
-
-        # Stap 2: Pas jouw specifieke regels toe per knelpunt
-        for (i in seq_len(nrow(knel_yr))) {
-          k_vhas <- knel_yr[[vhas_col_knelpunt]][i]
-          match_found_via_vhas <- FALSE
-
-          # Regel 1: Probeer te matchen op VHAS
-          if (!is.na(k_vhas) && k_vhas != "") {
-            net_idx <- which(net_sf[[vhas_col_network]] == k_vhas)
-
-            if (length(net_idx) > 0) {
-              # Zoek dichtstbijzijnde segment BINNEN de correcte VHAS
-              rel_idx <- st_nearest_feature(knel_yr[i, ], net_sf[net_idx, ])
-              abs_idx <- net_idx[rel_idx]
-
-              # Snap hierop, ONGEACHT de afstand
-              snapped_barriers[i] <- as.character(net_sf$from_node[abs_idx])
-              match_found_via_vhas <- TRUE
-            }
-          }
-
-          # Regel 2: Geen VHAS match gevonden? Gebruik de fallback (mét 25m restrictie)
-          if (!match_found_via_vhas) {
-            if (valid_fallback[i]) {
-              snapped_barriers[i] <- as.character(net_sf$from_node[fallback_idx[i]])
-            } else {
-              # Ligt verder dan 25m en geen VHAS? Dan vervalt dit knelpunt
-              snapped_barriers[i] <- NA
-            }
-          }
-        }
-
-        barrier_nodes <- unique(na.omit(snapped_barriers))
-        message(paste(" ->", length(barrier_nodes), "knelpunten succesvol gesnapt."))
-      } else {
-        message(" -> Geen actieve migratieknelpunten in dit jaar.")
-      }
-    }
-
-    # D. Graaf aanpassen voor het huidige jaar
-    # Let op: als een observatie *exact* op een knelpunt valt, halen we die start_node eruit
-    # anders faalt het algoritme. Hij verspreidt dan niet.
-    start_nodes <- setdiff(start_nodes, barrier_nodes)
-
-    if (length(start_nodes) == 0) {
-      message(" -> Alle startpunten vallen exact op een knelpunt en zijn geblokkeerd. Overslaan.")
-      next
-    }
-
-    # Verwijder de knooppunten uit de graaf. Hierdoor is de verbinding daar definitief doorgeknipt.
-    g_yr <- g_base
-    if (length(barrier_nodes) > 0) {
-      # igraph filtert op vertex names
-      nodes_to_delete <- V(g_yr)[name %in% barrier_nodes]
-      g_yr <- delete_vertices(g_yr, nodes_to_delete)
-    }
-
-    # E. Netwerkafstanden en clusters berekenen
-    dist_matrix <- distances(g_yr, v = start_nodes, mode = "all")
-    min_dists <- apply(dist_matrix, 2, min)
-    valid_nodes <- colnames(dist_matrix)[is.finite(min_dists) & min_dists <= max_dist_m]
-
-    # Componenten bepalen op basis van bereikbare gebieden
-    sub_g <- induced_subgraph(g_yr, valid_nodes)
-    comps <- components(sub_g)
-
-    node_clusters <- data.frame(
-      node_id = names(comps$membership),
-      cluster_id_temp = as.character(comps$membership)
-    )
-
-    # F. Samenvoegen tot MULTILINESTRING en jaar toevoegen
-    cluster_segments <- net_sf %>%
-      inner_join(node_clusters, by = c("from_node" = "node_id"))
-
-    clusters_sf_yr <- cluster_segments %>%
-      group_by(cluster_id_temp) %>%
-      summarise(
-        jaar = yr,
-        n_segmenten = n(),
-        totale_lengte_km = round(sum(weight) / 1000, 2),
-        geometry = st_union(geometry),
-        .groups = "drop"
-      ) %>%
-      mutate(cluster_id = paste0("Y", yr, "_C", cluster_id_temp)) %>%
-      select(cluster_id, jaar, n_segmenten, totale_lengte_km, geometry) %>%
-      st_cast("MULTILINESTRING")
-
-    all_clusters[[as.character(yr)]] <- clusters_sf_yr
-    message(paste(" ->", nrow(clusters_sf_yr), "clusters gegenereerd voor", yr))
-  }
-
-  # --- 3. Resultaten bundelen ---
-  if (length(all_clusters) > 0) {
-    final_clusters_sf <- bind_rows(all_clusters)
-    message(paste("\nKlaar! In totaal", nrow(final_clusters_sf), "clusters gegenereerd over alle jaren heen."))
-    return(final_clusters_sf)
-  } else {
-    message("\nKlaar! Geen clusters kunnen genereren.")
-    return(NULL)
-  }
-}
-
-beekprik_habitat_historiek <- get_beekprik_clusters_tijdreeks(
-  observations_sf = beekprik,
-  network_list = river_network_fine,
-  knelpunten_sf = knelpunten_tijdreeks,  # Je nieuwe knelpuntenlaag
-  target_years = 2015:2024,
-  max_dist_m = 3000,
-  snap_tolerance_obs = 50,
-  snap_tolerance_knelpunt = 25,          # Strengere snap voor knelpunten
-  time_col = "jaar",
-  vhas_col_knelpunt = "vhas",            # Kolomnaam in je tibble
-  vhas_col_network = "VHAS"              # Kolomnaam in fd
-)
-
-# Kijken naar de evolutie:
-mapview(beekprik_habitat_historiek, zcol = "jaar", burst = TRUE)
-
-
-get_beekprik_clusters_tijdreeks_fast <- function(observations_sf,
                                                  network_list,
                                                  knelpunten_sf = NULL,
                                                  target_years = NULL,
@@ -614,15 +433,26 @@ get_beekprik_clusters_tijdreeks_fast <- function(observations_sf,
   }
 }
 
-beekprik_habitat_historiek <- get_beekprik_clusters_tijdreeks_fast(
-  observations_sf = beekprik,
+beekprik_habitat_historiek <- get_beekprik_clusters_tijdreeks(
+  observations_sf = beekprik_aanwezig,
   network_list = river_network_fine,
-  knelpunten_sf = knelpunten_tijdreeks,  # Je nieuwe knelpuntenlaag
-  target_years = 2015,
+  knelpunten_sf = knelpunten_tijdreeks,
+  target_years = 2015:2024,
   max_dist_m = 3000,
-  snap_tolerance_obs = 50,
-  # snap_tolerance_knelpunt = 25,          # Strengere snap voor knelpunten
+  snap_tolerance_obs = 25,
   time_col = "jaar",
   vhas_col_knelpunt = "vhas",            # Kolomnaam in je tibble
   vhas_col_network = "VHAS"              # Kolomnaam in fd
 )
+
+mapview(beekprik_habitat_historiek, zcol = "jaar", burst = TRUE) #evolutie per jaar
+
+# visualisatie 2015
+beekprik_2015_aanwezig <- beekprik_aanwezig %>% filter(jaar %in% 2015)
+beekprik_2015_clusters <- beekprik_habitat_historiek %>% filter(jaar %in% 2015)
+knelpunten_2015 <- knelpunten_tijdreeks %>% filter(jaar %in% 2015)
+
+mapview(fd) +
+  mapview(beekprik_2015_clusters, color = "green") +
+  mapview(beekprik_2015, col.region = "yellow") +
+  mapview(knelpunten_2015, col.region = "red", cex = 1.5)
